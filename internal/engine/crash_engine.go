@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -21,6 +23,11 @@ var (
 )
 
 type Config struct {
+	// ServerSeed, si non vide, fixe le seed pour TOUS les rounds —
+	// réservé aux tests déterministes. NE JAMAIS le renseigner en
+	// production : ça annule la garantie provably-fair (seed
+	// prévisible dès le round 2). Laisser vide en prod : un seed
+	// cryptographiquement aléatoire est généré à chaque round.
 	ServerSeed string
 	ClientSeed string
 
@@ -37,7 +44,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		ServerSeed: "CHANGE_ME_SERVER_SEED",
+		ServerSeed: "", // vide = rotation aléatoire par round (production)
 		ClientSeed: "223CRASH",
 
 		HouseEdge: 0.01,
@@ -57,6 +64,14 @@ type EngineStateSnapshot struct {
 	State   game.RoundState
 
 	Multiplier float64
+
+	// ServerSeedHash est l'engagement cryptographique du seed du round
+	// courant. Public dès BETTING_OPEN — ne révèle rien.
+	ServerSeedHash string
+
+	// ServerSeed est le seed en clair. Vide tant que le round n'a pas
+	// crashé — ne JAMAIS le peupler avant CRASHED/SETTLED.
+	ServerSeed string
 
 	// CrashPoint est volontairement disponible uniquement
 	// dans l'état interne du moteur.
@@ -85,9 +100,10 @@ type CrashEngine struct {
 	rm *game.RoundManager
 	bm *game.BetManager
 
-	serverSeed string
-	clientSeed string
-	houseEdge  float64
+	// fixedServerSeed n'est non-vide qu'en contexte de test.
+	fixedServerSeed string
+	clientSeed      string
+	houseEdge       float64
 
 	bettingDuration time.Duration
 	tickInterval    time.Duration
@@ -101,16 +117,18 @@ type CrashEngine struct {
 	crashPoint        float64
 	nonce             uint64
 
+	// roundServerSeed/Hash : seed effectif du round en cours.
+	// Généré (ou repris de fixedServerSeed) au début de chaque round,
+	// jamais réutilisé d'un round à l'autre en production.
+	roundServerSeed     string
+	roundServerSeedHash string
+
 	broadcast chan EngineStateSnapshot
 
 	running bool
 }
 
 func NewCrashEngine(cfg Config) (*CrashEngine, error) {
-	if cfg.ServerSeed == "" {
-		return nil, ErrInvalidConfig
-	}
-
 	if cfg.ClientSeed == "" {
 		return nil, ErrInvalidConfig
 	}
@@ -143,9 +161,9 @@ func NewCrashEngine(cfg Config) (*CrashEngine, error) {
 		rm: game.NewRoundManager(cfg.EventBuffer),
 		bm: game.NewBetManager(),
 
-		serverSeed: cfg.ServerSeed,
-		clientSeed: cfg.ClientSeed,
-		houseEdge:  cfg.HouseEdge,
+		fixedServerSeed: cfg.ServerSeed,
+		clientSeed:      cfg.ClientSeed,
+		houseEdge:       cfg.HouseEdge,
 
 		bettingDuration: cfg.BettingDuration,
 		tickInterval:    cfg.TickInterval,
@@ -215,6 +233,23 @@ func (e *CrashEngine) runRound(ctx context.Context) error {
 		return err
 	}
 
+	// Seed du round : fixe seulement si explicitement configuré pour les
+	// tests, sinon aléatoire et unique à ce round précis.
+	roundSeed := e.fixedServerSeed
+	if roundSeed == "" {
+		roundSeed, err = generateServerSeed()
+		if err != nil {
+			return fmt.Errorf("server seed generation failed: %w", err)
+		}
+	}
+
+	seedHash, err := HashServerSeed(roundSeed)
+	if err != nil {
+		return fmt.Errorf("server seed hash failed: %w", err)
+	}
+
+	e.setRoundSeed(roundSeed, seedHash)
+
 	if err := e.bm.OpenRound(round.ID); err != nil {
 		return err
 	}
@@ -226,10 +261,11 @@ func (e *CrashEngine) runRound(ctx context.Context) error {
 	e.setMultiplier(1.00)
 
 	e.publish(EngineStateSnapshot{
-		RoundID:    round.ID,
-		State:      game.StateBettingOpen,
-		Multiplier: 1.00,
-		Timestamp:  now,
+		RoundID:        round.ID,
+		State:          game.StateBettingOpen,
+		Multiplier:     1.00,
+		ServerSeedHash: seedHash,
+		Timestamp:      now,
 	})
 
 	if err := waitContext(ctx, e.bettingDuration); err != nil {
@@ -247,7 +283,7 @@ func (e *CrashEngine) runRound(ctx context.Context) error {
 	}
 
 	crashPoint, err := CrashPoint(
-		e.serverSeed,
+		roundSeed,
 		e.clientSeed,
 		e.currentNonce(),
 		e.houseEdge,
@@ -273,13 +309,14 @@ func (e *CrashEngine) runRound(ctx context.Context) error {
 	}
 
 	e.publish(EngineStateSnapshot{
-		RoundID:    round.ID,
-		State:      game.StateRunning,
-		Multiplier: 1.00,
-		Timestamp:  now,
+		RoundID:        round.ID,
+		State:          game.StateRunning,
+		Multiplier:     1.00,
+		ServerSeedHash: seedHash,
+		Timestamp:      now,
 	})
 
-	if err := e.runUntilCrash(ctx, round.ID, crashPoint); err != nil {
+	if err := e.runUntilCrash(ctx, round.ID, crashPoint, seedHash); err != nil {
 		return err
 	}
 
@@ -305,12 +342,15 @@ func (e *CrashEngine) runRound(ctx context.Context) error {
 		)
 	}
 
+	// Reveal : le seed en clair n'est jamais publié avant cet instant.
 	e.publish(EngineStateSnapshot{
-		RoundID:    round.ID,
-		State:      game.StateCrashed,
-		Multiplier: crashPoint,
-		CrashPoint: crashPoint,
-		Timestamp:  now,
+		RoundID:        round.ID,
+		State:          game.StateCrashed,
+		Multiplier:     crashPoint,
+		CrashPoint:     crashPoint,
+		ServerSeedHash: seedHash,
+		ServerSeed:     roundSeed,
+		Timestamp:      now,
 	})
 
 	if err := e.rm.Settle(time.Now()); err != nil {
@@ -322,17 +362,20 @@ func (e *CrashEngine) runRound(ctx context.Context) error {
 	}
 
 	e.publish(EngineStateSnapshot{
-		RoundID:    round.ID,
-		State:      game.StateSettled,
-		Multiplier: crashPoint,
-		CrashPoint: crashPoint,
-		Timestamp:  time.Now(),
+		RoundID:        round.ID,
+		State:          game.StateSettled,
+		Multiplier:     crashPoint,
+		CrashPoint:     crashPoint,
+		ServerSeedHash: seedHash,
+		ServerSeed:     roundSeed,
+		Timestamp:      time.Now(),
 	})
 
 	e.nextNonce()
 
 	e.setCrashPoint(0)
 	e.setMultiplier(1.00)
+	e.setRoundSeed("", "")
 
 	return nil
 }
@@ -341,6 +384,7 @@ func (e *CrashEngine) runUntilCrash(
 	ctx context.Context,
 	roundID string,
 	crashPoint float64,
+	seedHash string,
 ) error {
 
 	ticker := time.NewTicker(e.tickInterval)
@@ -366,10 +410,11 @@ func (e *CrashEngine) runUntilCrash(
 			e.setMultiplier(multiplier)
 
 			e.publish(EngineStateSnapshot{
-				RoundID:    roundID,
-				State:      game.StateRunning,
-				Multiplier: multiplier,
-				Timestamp:  now,
+				RoundID:        roundID,
+				State:          game.StateRunning,
+				Multiplier:     multiplier,
+				ServerSeedHash: seedHash,
+				Timestamp:      now,
 			})
 		}
 	}
@@ -488,22 +533,26 @@ func (e *CrashEngine) CurrentState() (EngineStateSnapshot, error) {
 
 	multiplier := e.currentMultiplier
 
-	// Le crash point est masqué pendant RUNNING.
+	// Le crash point ET le seed en clair sont masqués pendant RUNNING.
 	//
-	// Il ne doit jamais être transmis au client avant le crash.
+	// Ils ne doivent jamais être transmis au client avant le crash.
 	crashPoint := float64(0)
+	revealedSeed := ""
 
 	if round.State == game.StateCrashed ||
 		round.State == game.StateSettled {
 		crashPoint = e.crashPoint
+		revealedSeed = e.roundServerSeed
 	}
 
 	return EngineStateSnapshot{
-		RoundID:    round.ID,
-		State:      round.State,
-		Multiplier: multiplier,
-		CrashPoint: crashPoint,
-		Timestamp:  time.Now(),
+		RoundID:        round.ID,
+		State:          round.State,
+		Multiplier:     multiplier,
+		CrashPoint:     crashPoint,
+		ServerSeedHash: e.roundServerSeedHash,
+		ServerSeed:     revealedSeed,
+		Timestamp:      time.Now(),
 	}, nil
 }
 
@@ -545,6 +594,13 @@ func (e *CrashEngine) setCrashPoint(crashPoint float64) {
 	e.mu.Unlock()
 }
 
+func (e *CrashEngine) setRoundSeed(seed, hash string) {
+	e.mu.Lock()
+	e.roundServerSeed = seed
+	e.roundServerSeedHash = hash
+	e.mu.Unlock()
+}
+
 func (e *CrashEngine) getMultiplier() float64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -577,6 +633,16 @@ func (e *CrashEngine) publish(snapshot EngineStateSnapshot) {
 		// Une couche de métriques devra être ajoutée
 		// pour compter ces pertes d'événements.
 	}
+}
+
+// generateServerSeed produit un seed cryptographiquement aléatoire de
+// 32 bytes, encodé en hex. Appelé une fois par round en production.
+func generateServerSeed() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 func calculateMultiplier(elapsedSeconds float64) float64 {
