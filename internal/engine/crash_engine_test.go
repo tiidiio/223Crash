@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"errors"
-	"log"
 	"testing"
 	"time"
 
@@ -15,16 +14,11 @@ func newTestEngine(t *testing.T) *CrashEngine {
 
 	cfg := DefaultConfig()
 
-	cfg.ServerSeed = "test-server-seed"
-	cfg.ClientSeed = "test-client-seed"
-
 	cfg.BettingDuration = 20 * time.Millisecond
+	cfg.CrashedDuration = 5 * time.Millisecond
 	cfg.TickInterval = 5 * time.Millisecond
-
-	cfg.Logger = log.Default()
-
 	cfg.EventBuffer = 128
-	cfg.BroadcastBuffer = 128
+	cfg.InitialClientSeed = "test-client-seed"
 
 	engine, err := NewCrashEngine(cfg)
 	if err != nil {
@@ -115,14 +109,11 @@ func TestCashoutUsesEngineMultiplier(t *testing.T) {
 
 	waitForState(t, engine, game.StateRunning)
 
-	// Le test récupère le multiplicateur du moteur.
-	state, err := engine.CurrentState()
-	if err != nil {
-		t.Fatalf("CurrentState: %v", err)
-	}
+	// Le test récupère le multiplicateur autoritaire du moteur.
+	multiplierBeforeCashout := engine.CurrentMultiplier()
 
-	if state.Multiplier < 1.00 {
-		t.Fatalf("invalid engine multiplier: %.2f", state.Multiplier)
+	if multiplierBeforeCashout < 1.00 {
+		t.Fatalf("invalid engine multiplier: %.2f", multiplierBeforeCashout)
 	}
 
 	// Aucun multiplicateur client n'est envoyé.
@@ -132,21 +123,15 @@ func TestCashoutUsesEngineMultiplier(t *testing.T) {
 		t.Fatalf("Cashout: %v", err)
 	}
 
-	if result.BetID != bet.ID {
-		t.Fatalf("unexpected bet id: %s", result.BetID)
+	if result.ID != bet.ID {
+		t.Fatalf("unexpected bet id: %s", result.ID)
 	}
 
-	if result.CashoutMulti != state.Multiplier {
-		// Le moteur peut avoir avancé entre CurrentState et Cashout.
-		//
-		// On vérifie surtout que la valeur est valide et
-		// qu'elle provient du moteur.
-		if result.CashoutMulti < 1.00 {
-			t.Fatalf(
-				"invalid authoritative cashout multiplier: %.2f",
-				result.CashoutMulti,
-			)
-		}
+	if result.CashoutMulti < 1.00 {
+		t.Fatalf(
+			"invalid authoritative cashout multiplier: %.2f",
+			result.CashoutMulti,
+		)
 	}
 
 	if result.Payout < bet.Amount {
@@ -192,15 +177,8 @@ func TestClientCannotInjectMultiplier(t *testing.T) {
 
 	waitForState(t, engine, game.StateRunning)
 
-	// Il n'existe volontairement aucune API :
-	//
-	// Cashout(betID, clientMultiplier)
-	//
-	// L'unique API est :
-	//
-	// Cashout(betID)
-	//
-	// Le multiplicateur est donc contrôlé par le serveur.
+	// Il n'existe volontairement aucune API Cashout(betID, clientMultiplier).
+	// L'unique API est Cashout(betID) : le multiplicateur est contrôlé par le serveur.
 	result, err := engine.Cashout(bet.ID)
 	if err != nil {
 		t.Fatalf("Cashout: %v", err)
@@ -280,20 +258,24 @@ func waitForState(
 	deadline := time.Now().Add(2 * time.Second)
 
 	for time.Now().Before(deadline) {
-		state, err := engine.CurrentState()
-		if err == nil && state.State == expected {
+		round, err := engine.CurrentRound()
+		if err == nil && round.State == expected {
 			return
 		}
 
 		time.Sleep(time.Millisecond)
 	}
 
-	state, err := engine.CurrentState()
+	round, err := engine.CurrentRound()
+	currentState := game.RoundState("unknown")
+	if round != nil {
+		currentState = round.State
+	}
 
 	t.Fatalf(
 		"timeout waiting for state=%s, current=%s, err=%v",
 		expected,
-		state.State,
+		currentState,
 		err,
 	)
 }

@@ -31,15 +31,21 @@ const (
 	BetLost      BetState = "LOST"
 )
 
+// BetPanel identifie l'un des 4 panels de mise simultanés par joueur (clone JetX Dual x4).
 type BetPanel uint8
 
 const (
 	Panel1 BetPanel = 1
 	Panel2 BetPanel = 2
+	Panel3 BetPanel = 3
+	Panel4 BetPanel = 4
 )
 
+// MaxBetPanels est le nombre de panels de mise simultanés autorisés par joueur.
+const MaxBetPanels = 4
+
 func (p BetPanel) IsValid() bool {
-	return p == Panel1 || p == Panel2
+	return p == Panel1 || p == Panel2 || p == Panel3 || p == Panel4
 }
 
 func (p BetPanel) String() string {
@@ -48,6 +54,10 @@ func (p BetPanel) String() string {
 		return "PANEL_1"
 	case Panel2:
 		return "PANEL_2"
+	case Panel3:
+		return "PANEL_3"
+	case Panel4:
+		return "PANEL_4"
 	default:
 		return "UNKNOWN"
 	}
@@ -149,6 +159,7 @@ func (bm *BetManager) StartRound() error {
 	return nil
 }
 
+// PlaceBet pose une mise sur l'un des 4 panels du joueur. Un seul pari actif par panel.
 func (bm *BetManager) PlaceBet(
 	userID string,
 	panel BetPanel,

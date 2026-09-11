@@ -45,15 +45,19 @@ func (p *Publisher) PublishTick(ctx context.Context, roundID string, multiplier 
 	return err
 }
 
-// PublishCrash reveals serverSeed for public provably-fair verification —
-// only call this once the round has actually crashed.
-func (p *Publisher) PublishCrash(ctx context.Context, roundID string, crashPoint float64, serverSeed string) error {
+// PublishCrash reveals serverSeed, clientSeed and nonce for public provably-fair
+// verification (GET /verify/{roundId} recalcule CrashPoint(serverSeed, clientSeed, nonce)
+// et compare au crashPoint publié) — only call this once the round has actually crashed.
+// clientSeed et nonce ne sont pas secrets ; seul serverSeed devait rester caché jusqu'ici.
+func (p *Publisher) PublishCrash(ctx context.Context, roundID string, crashPoint float64, serverSeed, clientSeed string, nonce int64) error {
 	_, err := p.store.Broadcast.InsertOne(ctx, BroadcastMessage{
 		Type: "CRASH",
 		Data: bson.M{
 			"roundId":    roundID,
 			"crashPoint": crashPoint,
 			"serverSeed": serverSeed,
+			"clientSeed": clientSeed,
+			"nonce":      nonce,
 		},
 		EmittedAtMs: nowMs(),
 	})
