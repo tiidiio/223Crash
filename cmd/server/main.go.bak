@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -11,23 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
-
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/mongobridge"
 )
 
-type healthResponse struct {
-	Status string `json:"status"`
-	Mongo  string `json:"mongo"`
-}
-
 func main() {
-	// Charge .env avant toute lecture des variables obligatoires.
-	if err := godotenv.Load(".env"); err != nil {
-		log.Printf("⚠️ .env non chargé: %v", err)
-	}
-
 	mongoURI := requireEnv("MONGO_URI")
 	mongoDB := envOr("MONGO_DB", "223crash")
 	jwtSecret := requireEnv("JWT_SECRET")
@@ -64,19 +51,8 @@ func main() {
 	static := http.NewServeMux()
 	static.HandleFunc("/", serveStatic)
 	static.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-
-		mongoStatus := "connected"
-		httpStatus := http.StatusOK
-		if err := store.Ping(pingCtx); err != nil {
-			mongoStatus = "down"
-			httpStatus = http.StatusServiceUnavailable
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(httpStatus)
-		json.NewEncoder(w).Encode(healthResponse{Status: "ok", Mongo: mongoStatus})
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
 	})
 	go serve(ctx, httpPort, static, "static")
 

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>223CRASH</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="topbar">
+  <div id="connection-status" data-state="disconnected"></div>
+  <div id="balance-display">--</div>
+  <div id="round-id"></div>
+</div>
+
+<div id="multiplier-zone">
+  <canvas id="game-canvas"></canvas>
+  <div id="multiplier-display">1.00x</div>
+  <div id="round-state">en attente</div>
+</div>
+
+<div id="history-strip"></div>
+
+<div id="panels">
+  <div class="bet-panel" data-slot="A" data-active="false">
+    <input type="number" class="amount" value="100" min="1" step="1">
+    <div class="quick-stakes">
+      <button data-add="100">+100</button>
+      <button data-add="500">+500</button>
+      <button data-add="1000">+1000</button>
+    </div>
+    <input type="number" class="auto-cashout" placeholder="Auto cashout (opt.)" min="1.01" step="0.01">
+    <button class="action-btn">MISER</button>
+  </div>
+  <div class="bet-panel" data-slot="B" data-active="false">
+    <input type="number" class="amount" value="100" min="1" step="1">
+    <div class="quick-stakes">
+      <button data-add="100">+100</button>
+      <button data-add="500">+500</button>
+      <button data-add="1000">+1000</button>
+    </div>
+    <input type="number" class="auto-cashout" placeholder="Auto cashout (opt.)" min="1.01" step="0.01">
+    <button class="action-btn">MISER</button>
+  </div>
+</div>
+
+<script type="module">
+import { CrashSocket } from './ws.js';
+
+const params = new URLSearchParams(location.search);
+const token = params.get('token');
+
+if (!token) {
+  document.getElementById('round-state').textContent = 'token manquant';
+} else {
+  const wsProtocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const wsUrl = `${wsProtocol}${location.hostname}:3000`;
+  const socket = new CrashSocket({ url: wsUrl, token });
+
+  const statusEl = document.getElementById('connection-status');
+  const balanceEl = document.getElementById('balance-display');
+  const roundIdEl = document.getElementById('round-id');
+  const multEl = document.getElementById('multiplier-display');
+  const roundStateEl = document.getElementById('round-state');
+  const zoneEl = document.getElementById('multiplier-zone');
+  const historyEl = document.getElementById('history-strip');
+  const canvas = document.getElementById('game-canvas');
+  const ctx = canvas.getContext('2d');
+
+  function resizeCanvas() {
+    canvas.width = zoneEl.clientWidth;
+    canvas.height = zoneEl.clientHeight;
+  }
+  resizeCanvas();
+  window.addEventListener('resize', resizeCanvas);
+
+  // formule engine confirmée : e^(0.00006 * elapsedMs)
+  function multiplierAt(elapsedMs) {
+    return Math.exp(0.00006 * elapsedMs);
+  }
+
+  let roundStartTs = null;
+  let rafId = null;
+
+  function drawCurve(elapsedMs) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const w = canvas.width, h = canvas.height;
+    ctx.beginPath();
+    ctx.strokeStyle = '#D4A54A';
+    ctx.lineWidth = 2;
+    const steps = 80;
+    let lastX = 0, lastY = h;
+    for (let i = 0; i <= steps; i++) {
+      const t = (elapsedMs * i) / steps;
+      const m = multiplierAt(t);
+      const x = (i / steps) * w * 0.9;
+      const y = h - Math.min((m - 1) * (h / 4), h * 0.85);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      lastX = x; lastY = y;
+    }
+    ctx.stroke();
+    // point teal = position courante (placeholder en attendant sprite avion)
+    ctx.beginPath();
+    ctx.fillStyle = '#4FB8AE';
+    ctx.arc(lastX, lastY, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function loop() {
+    if (roundStartTs) {
+      drawCurve(performance.now() - roundStartTs);
+    }
+    rafId = requestAnimationFrame(loop);
+  }
+  loop();
+
+  function pushHistory(crashPoint) {
+    const el = document.createElement('div');
+    el.className = 'entry ' + (crashPoint < 1.5 ? 'low' : crashPoint < 5 ? 'mid' : 'high');
+    el.textContent = crashPoint.toFixed(2) + 'x';
+    historyEl.prepend(el);
+    while (historyEl.children.length > 30) historyEl.lastChild.remove();
+  }
+
+  socket.addEventListener('status', (e) => {
+    statusEl.dataset.state = e.detail.state;
+  });
+
+  socket.addEventListener('balance', (e) => {
+    balanceEl.textContent = Number(e.detail.balance).toFixed(2);
+  });
+
+  socket.addEventListener('serverError', (e) => {
+    roundStateEl.textContent = e.detail.reason || 'erreur';
+  });
+
+  socket.addEventListener('broadcast', (e) => {
+    const { type, data } = e.detail;
+    if (type === 'ROUND_START') {
+      roundIdEl.textContent = data.roundId ?? '';
+      roundStateEl.textContent = 'mises ouvertes';
+      multEl.textContent = '1.00x';
+      multEl.classList.remove('crashed');
+      zoneEl.classList.remove('crashed');
+      roundStartTs = null;
+    } else if (type === 'TICK') {
+      if (roundStartTs === null) roundStartTs = performance.now() - (data.elapsedMs || 0);
+      roundStateEl.textContent = 'en vol';
+      multEl.textContent = Number(data.multiplier).toFixed(2) + 'x';
+    } else if (type === 'CRASH') {
+      roundStateEl.textContent = 'crashé';
+      multEl.textContent = Number(data.crashPoint).toFixed(2) + 'x';
+      multEl.classList.add('crashed');
+      zoneEl.classList.add('crashed');
+      pushHistory(data.crashPoint);
+      roundStartTs = null;
+    }
+  });
+
+  socket.addEventListener('playerEvent', (e) => {
+    const { type, data } = e.detail;
+    const panel = document.querySelector(`.bet-panel[data-slot="${data.slot}"]`);
+    if (!panel) return;
+    if (type === 'BET_ACCEPTED') panel.dataset.active = 'true';
+    if (type === 'BET_REJECTED') panel.dataset.active = 'false';
+    if (type === 'CASHOUT_ACCEPTED' || type === 'CASHOUT_REJECTED') panel.dataset.active = 'false';
+  });
+
+  document.querySelectorAll('.bet-panel').forEach((panel) => {
+    const slot = panel.dataset.slot;
+    const amountInput = panel.querySelector('.amount');
+    const autoInput = panel.querySelector('.auto-cashout');
+    const btn = panel.querySelector('.action-btn');
+
+    panel.querySelectorAll('.quick-stakes button').forEach((b) => {
+      b.addEventListener('click', () => {
+        amountInput.value = Number(amountInput.value || 0) + Number(b.dataset.add);
+      });
+    });
+
+    btn.addEventListener('click', () => {
+      if (panel.dataset.active === 'true') {
+        socket.cashout(slot);
+      } else {
+        const amount = Number(amountInput.value);
+        const auto = autoInput.value ? Number(autoInput.value) : null;
+        if (amount > 0) socket.bet(slot, amount, auto);
+      }
+    });
+  });
+
+  socket.connect();
+}
+</script>
+</body>
+</html>
