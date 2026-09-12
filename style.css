@@ -1,0 +1,282 @@
+/* 223CRASH — ticket de pari vérifiable, dark space */
+
+:root {
+  --bg: #0A0C10;
+  --panel: #14171D;
+  --panel-alt: #1B1F27;
+  --border: #262B35;
+  --text: #E7E9EE;
+  --text-dim: #8B92A0;
+  --gold: #D4A54A;
+  --red: #C2493D;
+  --teal: #4FB8AE;
+  --mono: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, Menlo, Consolas, monospace;
+  --sans: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  -webkit-tap-highlight-color: transparent;
+  overflow-x: hidden;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* ---------- topbar ---------- */
+
+#topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+#connection-status {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex-shrink: 0;
+}
+#connection-status[data-state="connected"]  { background: var(--teal); box-shadow: 0 0 6px var(--teal); }
+#connection-status[data-state="connecting"] { background: var(--gold); animation: pulse 1s infinite; }
+#connection-status[data-state="disconnected"] { background: var(--red); }
+
+#balance-display {
+  flex: 1;
+  text-align: center;
+  color: var(--gold);
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+#round-id {
+  color: var(--text-dim);
+  font-size: 11px;
+  min-width: 40px;
+  text-align: right;
+}
+
+/* ---------- multiplier zone ---------- */
+
+#multiplier-zone {
+  position: relative;
+  flex: 1;
+  min-height: 240px;
+  margin: 10px 14px 0;
+  border-radius: 10px;
+  background:
+    radial-gradient(circle at 50% 15%, rgba(79,184,174,0.06), transparent 60%),
+    var(--panel);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#game-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+#multiplier-display {
+  position: relative;
+  z-index: 1;
+  font-family: var(--sans);
+  font-weight: 700;
+  font-size: clamp(36px, 12vw, 64px);
+  letter-spacing: 0.5px;
+  color: var(--text);
+  text-shadow: 0 0 24px rgba(212,165,74,0.25);
+  transition: color 0.15s ease;
+}
+#multiplier-display.crashed {
+  color: var(--red);
+  text-shadow: 0 0 24px rgba(194,73,61,0.45);
+}
+
+#round-state {
+  position: absolute;
+  bottom: 10px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  z-index: 1;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+#multiplier-zone.crashed {
+  animation: shake 0.35s ease;
+  border-color: rgba(194,73,61,0.5);
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-6px); }
+  40% { transform: translateX(5px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(2px); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* ---------- history strip ---------- */
+
+#history-strip {
+  display: flex;
+  gap: 6px;
+  padding: 10px 14px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex-shrink: 0;
+}
+#history-strip::-webkit-scrollbar { display: none; }
+
+#history-strip .entry {
+  flex-shrink: 0;
+  padding: 4px 9px;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+}
+#history-strip .entry.low  { color: var(--red); }
+#history-strip .entry.mid  { color: var(--text-dim); }
+#history-strip .entry.high { color: var(--teal); }
+
+/* ---------- bet panels ---------- */
+
+#panels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  padding: 10px 14px 16px;
+  flex-shrink: 0;
+}
+
+.bet-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 10px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.bet-panel::before {
+  content: "SLOT " attr(data-slot);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+}
+
+.bet-panel[data-active="true"] {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 1px rgba(79,184,174,0.25), 0 0 14px rgba(79,184,174,0.12);
+}
+
+.bet-panel input {
+  width: 100%;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  padding: 8px 10px;
+  outline: none;
+}
+.bet-panel input:focus { border-color: var(--gold); }
+.bet-panel input::placeholder { color: var(--text-dim); }
+
+.bet-panel input.amount { font-weight: 600; }
+
+.bet-panel input[type=number]::-webkit-inner-spin-button,
+.bet-panel input[type=number]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.quick-stakes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.quick-stakes button {
+  padding: 6px 0;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+.quick-stakes button:active { background: var(--border); color: var(--text); }
+
+.action-btn {
+  margin-top: 2px;
+  padding: 12px 0;
+  border: none;
+  border-radius: 8px;
+  background: var(--gold);
+  color: #14100A;
+  font-family: var(--sans);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+}
+.action-btn:active { filter: brightness(0.9); }
+
+.bet-panel[data-active="true"] .action-btn {
+  background: var(--red);
+  color: #FFF3F1;
+}
+
+.bet-panel input:disabled,
+.bet-panel button:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* ---------- small screens ---------- */
+
+@media (max-width: 360px) {
+  #topbar { font-size: 12px; padding: 8px 10px; }
+  #multiplier-zone { margin: 8px 10px 0; min-height: 200px; }
+  #panels { padding: 8px 10px 12px; gap: 8px; }
+  .quick-stakes button { font-size: 10px; }
+}EOF

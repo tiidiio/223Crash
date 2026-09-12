@@ -2,9 +2,14 @@ module github.com/tiidiio/223Gaming/223Crash
 
 go 1.26.4
 
-require go.mongodb.org/mongo-driver/v2 v2.9.0
+require (
+	github.com/golang-jwt/jwt/v5 v5.2.1
+	github.com/gorilla/websocket v1.5.3
+	go.mongodb.org/mongo-driver/v2 v2.9.0
+)
 
 require (
+	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
 	github.com/xdg-go/scram v1.2.0 // indirect

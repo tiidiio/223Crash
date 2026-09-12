@@ -88,6 +88,15 @@ func isNamespaceExists(err error) bool {
 	return false
 }
 
+// Ping vérifie l'état live de la connexion Mongo — utilisé par /healthz.
+// Timeout court volontairement : un healthcheck ne doit jamais bloquer
+// plus de 2s, sinon il masque un problème réseau derrière un faux "up".
+func (s *Store) Ping(ctx context.Context) error {
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return s.Client.Ping(pingCtx, nil)
+}
+
 func (s *Store) Close(ctx context.Context) error {
 	return s.Client.Disconnect(ctx)
 }
