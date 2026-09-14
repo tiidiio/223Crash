@@ -1,0 +1,10 @@
++0.42s [open]
++0.43s [recv] {"playerId":"player1","type":"CONNECTED"}
++0.43s [recv] {"balance":900,"type":"BALANCE"}
++17.92s [recv] {"data":{"crashPoint":21.8,"roundId":"round-2"},"type":"CRASH"}
++17.92s [recv] {"data":{"reason":"round_crashed","slot":"A"},"type":"CASHOUT_REJECTED"}
++18.07s [recv] {"data":{"roundId":"round-3","serverSeedHash":"cc6ff194abc3c6c8ec40c50d8056b8ba176b70b0da1618bf0aeed7cde1aaadd8","startsAt":"2026-09-13T23:17:51.684621749Z"},"type":"ROUND_START"}
++18.07s [send] bet A 100 autoCashout=1.05 (round round-3 )
++18.41s [recv] {"data":{"reason":"betting is closed","slot":"A"},"type":"BET_REJECTED"}
++18.41s [ANALYSE] rejet 336ms après ROUND_START côté client (ticks reçus avant rejet: 107)
++18.43s [fin test] roundId testé = round-3 ticks reçus au total: 108

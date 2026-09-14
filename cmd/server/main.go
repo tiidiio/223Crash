@@ -15,6 +15,7 @@ import (
 
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/mongobridge"
+	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
 )
 
 type healthResponse struct {
@@ -34,6 +35,8 @@ func main() {
 	httpPort := envOr("HTTP_PORT", "8080")
 	wsPort := envOr("WS_PORT", "3000")
 	verifyPort := envOr("VERIFY_PORT", "8090")
+	walletURL := requireEnv("WALLET_URL")
+	walletSecret := requireEnv("WALLET_HMAC_SECRET")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -46,12 +49,19 @@ func main() {
 
 	publisher := mongobridge.NewPublisher(store)
 
+	walletClient := wallet.NewClient(walletURL, walletSecret)
+	walletQueue, err := wallet.NewQueue(ctx, mongoURI, mongoDB, walletClient)
+	if err != nil {
+		log.Fatalf("wallet queue: %v", err)
+	}
+	go walletQueue.Run(ctx)
+
 	eng, err := engine.NewCrashEngine(engine.DefaultConfig())
 	if err != nil {
 		log.Fatalf("engine: %v", err)
 	}
 
-	gw := newGateway(eng, jwtSecret)
+	gw := newGateway(eng, jwtSecret, walletClient, walletQueue)
 
 	go func() {
 		if err := eng.Run(ctx); err != nil && ctx.Err() == nil {

@@ -1,17 +1,28 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/game"
+	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
 )
+
+// centimesPerUnit convertit l'unité majeure affichée au joueur (frontend, step=1)
+// vers l'unité mineure attendue par internal/wallet.Callback.Amount (centimes) —
+// même unité que mockwallet.startingBalance (100000 = 1000.00). Toute la chaîne
+// DEBIT/CREDIT/ROLLBACK doit rester en centimes ; ne JAMAIS repasser en float ici.
+const centimesPerUnit = 100
 
 type wsClaims struct {
 	OperatorID string `json:"operatorId"`
@@ -55,18 +66,22 @@ func (c *client) writePump() {
 }
 
 type gateway struct {
-	eng       *engine.CrashEngine
-	jwtSecret []byte
+	eng          *engine.CrashEngine
+	jwtSecret    []byte
+	walletClient *wallet.Client
+	walletQueue  *wallet.Queue
 
 	mu      sync.RWMutex
 	clients map[string]*client // playerID -> client
 }
 
-func newGateway(eng *engine.CrashEngine, jwtSecret string) *gateway {
+func newGateway(eng *engine.CrashEngine, jwtSecret string, walletClient *wallet.Client, walletQueue *wallet.Queue) *gateway {
 	return &gateway{
-		eng:       eng,
-		jwtSecret: []byte(jwtSecret),
-		clients:   make(map[string]*client),
+		eng:          eng,
+		jwtSecret:    []byte(jwtSecret),
+		walletClient: walletClient,
+		walletQueue:  walletQueue,
+		clients:      make(map[string]*client),
 	}
 }
 
@@ -104,27 +119,71 @@ func (gw *gateway) broadcast(msgType string, data map[string]any) {
 	}
 }
 
+// settleCashout centralise le crédit wallet après un cashout réussi (manuel ou auto),
+// pour ne pas dupliquer la logique CREDIT entre handleCashout et checkAutoCashout.
+// bet.Payout est en centimes (même unité que le DEBIT initial) — reconverti en unité
+// majeure uniquement pour l'affichage client (CASHOUT_ACCEPTED).
+func (gw *gateway) settleCashout(c *client, bet *game.Bet) {
+	if bet.Payout > 0 {
+		cb := wallet.Callback{
+			ID:             fmt.Sprintf("credit-%s", bet.ID),
+			Type:           wallet.CallbackCredit,
+			OperatorID:     c.operatorID,
+			PlayerID:       c.playerID,
+			RoundID:        bet.RoundID,
+			BetID:          bet.ID,
+			Amount:         bet.Payout,
+			IdempotencyKey: fmt.Sprintf("credit:%s", bet.ID),
+		}
+		if err := gw.walletQueue.Enqueue(context.Background(), cb); err != nil {
+			log.Printf("wallet: enqueue CREDIT bet=%s: %v", bet.ID, err)
+		}
+	}
+
+	c.mu.Lock()
+	delete(c.activeBets, bet.Panel)
+	c.mu.Unlock()
+
+	c.sendJSON(map[string]any{"type": "CASHOUT_ACCEPTED", "data": map[string]any{
+		"slot":   panelToSlot(bet.Panel),
+		"payout": centimesToUnits(bet.Payout),
+	}})
+}
+
 // checkAutoCashout implémente ce que internal/engine ne fait pas : exécuter un cashout
 // quand CashoutTarget est atteint. Appelé à chaque TICK depuis forwardEvents.
 func (gw *gateway) checkAutoCashout(currentMultiplier float64) {
 	gw.mu.RLock()
-	defer gw.mu.RUnlock()
+	clientsSnapshot := make([]*client, 0, len(gw.clients))
 	for _, c := range gw.clients {
+		clientsSnapshot = append(clientsSnapshot, c)
+	}
+	gw.mu.RUnlock()
+
+	for _, c := range clientsSnapshot {
 		c.mu.Lock()
+		var toCashout []*game.Bet
 		for panel, bet := range c.activeBets {
 			if bet.CashoutTarget <= currentMultiplier {
-				if _, err := gw.eng.Cashout(bet.ID); err == nil {
-					c.sendJSON(map[string]any{"type": "CASHOUT_ACCEPTED", "data": map[string]any{"slot": panelToSlot(panel)}})
-				}
-				delete(c.activeBets, panel)
+				toCashout = append(toCashout, bet)
+				_ = panel
 			}
 		}
 		c.mu.Unlock()
+
+		for _, bet := range toCashout {
+			settled, err := gw.eng.Cashout(bet.ID)
+			if err != nil {
+				continue
+			}
+			gw.settleCashout(c, settled)
+		}
 	}
 }
 
 // notifyLostBets force le reset visuel du panel côté frontend (data-active) pour les paris
-// perdants — index.html ne gère aucun event dédié pour ce cas, on réutilise CASHOUT_REJECTED.
+// perdants — aucune action wallet : le joueur a déjà été débité au moment du pari, la perte
+// est déjà actée côté opérateur, un CRASH n'est pas un événement wallet.
 func (gw *gateway) notifyLostBets(lost []game.Bet) {
 	gw.mu.RLock()
 	defer gw.mu.RUnlock()
@@ -175,8 +234,16 @@ func (gw *gateway) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	go gw.readPump(c)
 
 	c.sendJSON(map[string]any{"type": "CONNECTED", "playerId": c.playerID})
-	// pas d'intégration wallet dans ce repo — solde placeholder
-	c.sendJSON(map[string]any{"type": "BALANCE", "balance": 0})
+
+	balCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	balance, err := gw.walletClient.GetBalance(balCtx, c.operatorID, c.playerID)
+	cancel()
+	if err != nil {
+		log.Printf("wallet: GetBalance player=%s: %v", c.playerID, err)
+		c.sendJSON(map[string]any{"type": "ERROR", "reason": "solde indisponible"})
+		balance = 0
+	}
+	c.sendJSON(map[string]any{"type": "BALANCE", "balance": centimesToUnits(balance)})
 }
 
 type clientMessage struct {
@@ -205,7 +272,14 @@ func (gw *gateway) readPump(c *client) {
 
 		switch msg.Action {
 		case "join":
-			c.sendJSON(map[string]any{"type": "BALANCE", "balance": 0})
+			balCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			balance, err := gw.walletClient.GetBalance(balCtx, c.operatorID, c.playerID)
+			cancel()
+			if err != nil {
+				log.Printf("wallet: GetBalance (join) player=%s: %v", c.playerID, err)
+				continue
+			}
+			c.sendJSON(map[string]any{"type": "BALANCE", "balance": centimesToUnits(balance)})
 		case "bet":
 			gw.handleBet(c, msg)
 		case "cashout":
@@ -221,9 +295,35 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 		return
 	}
 
-	amount := int64(msg.Amount)
+	// msg.Amount arrive en unité majeure (ex: 100 = "100" affiché côté joueur, index.html
+	// impose step=1 donc pas de décimales attendues). Toute la chaîne wallet (mockwallet,
+	// Callback.Amount, engine.Bet) raisonne en centimes — voir centimesPerUnit ci-dessus.
+	// On rejette explicitement tout montant fractionnaire au lieu de le tronquer en silence.
+	if msg.Amount != math.Trunc(msg.Amount) {
+		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "montant invalide"}})
+		return
+	}
+	amount := int64(msg.Amount) * centimesPerUnit
 	if amount <= 0 {
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "montant invalide"}})
+		return
+	}
+
+	round, err := gw.eng.CurrentRound()
+	if err != nil {
+		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "aucun round actif"}})
+		return
+	}
+
+	// DEBIT synchrone et bloquant : si l'opérateur refuse (fonds insuffisants, down),
+	// le pari n'est jamais engagé côté engine. C'est volontairement le seul point
+	// synchrone de tout le flux wallet — le reste (CREDIT/ROLLBACK) passe par la queue.
+	debitID := fmt.Sprintf("debit-%s-%s-%d", c.playerID, msg.Slot, time.Now().UnixNano())
+	debitCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, err = gw.walletClient.Debit(debitCtx, c.operatorID, c.playerID, round.ID, debitID, amount)
+	cancel()
+	if err != nil {
+		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "débit refusé"}})
 		return
 	}
 
@@ -234,6 +334,22 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 
 	bet, err := gw.eng.PlaceBet(c.playerID, panel, amount, cashoutTarget)
 	if err != nil {
+		// Le débit a réussi mais le pari n'a pas pu être engagé (round fermé entre-temps,
+		// slot déjà occupé, etc.) : on rend l'argent via ROLLBACK, asynchrone avec retry —
+		// contrairement au DEBIT, on ne peut pas se permettre de bloquer le joueur ici.
+		rb := wallet.Callback{
+			ID:             fmt.Sprintf("rollback-%s", debitID),
+			Type:           wallet.CallbackRollback,
+			OperatorID:     c.operatorID,
+			PlayerID:       c.playerID,
+			RoundID:        round.ID,
+			BetID:          debitID,
+			Amount:         amount,
+			IdempotencyKey: fmt.Sprintf("rollback:%s", debitID),
+		}
+		if qErr := gw.walletQueue.Enqueue(context.Background(), rb); qErr != nil {
+			log.Printf("wallet: enqueue ROLLBACK debit=%s: %v", debitID, qErr)
+		}
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": err.Error()}})
 		return
 	}
@@ -259,16 +375,13 @@ func (gw *gateway) handleCashout(c *client, msg clientMessage) {
 		return
 	}
 
-	if _, err := gw.eng.Cashout(bet.ID); err != nil {
+	settled, err := gw.eng.Cashout(bet.ID)
+	if err != nil {
 		c.sendJSON(map[string]any{"type": "CASHOUT_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": err.Error()}})
 		return
 	}
 
-	c.mu.Lock()
-	delete(c.activeBets, panel)
-	c.mu.Unlock()
-
-	c.sendJSON(map[string]any{"type": "CASHOUT_ACCEPTED", "data": map[string]any{"slot": msg.Slot}})
+	gw.settleCashout(c, settled)
 }
 
 func slotToPanel(slot string) (game.BetPanel, bool) {
@@ -291,4 +404,8 @@ func panelToSlot(panel game.BetPanel) string {
 	default:
 		return "?"
 	}
+}
+
+func centimesToUnits(centimes int64) float64 {
+	return float64(centimes) / centimesPerUnit
 }

@@ -54,8 +54,11 @@ body {
   flex-shrink: 0;
 }
 #connection-status[data-state="connected"]  { background: var(--teal); box-shadow: 0 0 6px var(--teal); }
-#connection-status[data-state="connecting"] { background: var(--gold); animation: pulse 1s infinite; }
-#connection-status[data-state="disconnected"] { background: var(--red); }
+#connection-status[data-state="connecting"],
+#connection-status[data-state="reconnecting"] { background: var(--gold); animation: pulse 1s infinite; }
+#connection-status[data-state="disconnected"],
+#connection-status[data-state="error"],
+#connection-status[data-state="stale"] { background: var(--red); }
 
 #balance-display {
   flex: 1;
@@ -179,6 +182,11 @@ body {
   gap: 10px;
   padding: 10px 14px 16px;
   flex-shrink: 0;
+  transition: opacity 0.15s ease;
+}
+
+#panels.panels-disabled {
+  opacity: 0.5;
 }
 
 .bet-panel {

@@ -51,6 +51,11 @@ import { CrashSocket } from './ws.js';
 const params = new URLSearchParams(location.search);
 const token = params.get('token');
 
+// Le token ne doit pas rester visible dans la barre d'adresse / l'historique.
+if (token) {
+  history.replaceState(null, '', location.pathname);
+}
+
 if (!token) {
   document.getElementById('round-state').textContent = 'token manquant';
 } else {
@@ -65,6 +70,7 @@ if (!token) {
   const roundStateEl = document.getElementById('round-state');
   const zoneEl = document.getElementById('multiplier-zone');
   const historyEl = document.getElementById('history-strip');
+  const panelsEl = document.getElementById('panels');
   const canvas = document.getElementById('game-canvas');
   const ctx = canvas.getContext('2d');
 
@@ -100,7 +106,6 @@ if (!token) {
       lastX = x; lastY = y;
     }
     ctx.stroke();
-    // point teal = position courante (placeholder en attendant sprite avion)
     ctx.beginPath();
     ctx.fillStyle = '#4FB8AE';
     ctx.arc(lastX, lastY, 5, 0, Math.PI * 2);
@@ -123,8 +128,32 @@ if (!token) {
     while (historyEl.children.length > 30) historyEl.lastChild.remove();
   }
 
+  function setPanelsInteractive(enabled) {
+    panelsEl.classList.toggle('panels-disabled', !enabled);
+    panelsEl.querySelectorAll('input, button').forEach((el) => {
+      el.disabled = !enabled;
+    });
+  }
+  // État initial : pas encore connecté
+  setPanelsInteractive(false);
+
+  function setPanelPending(panel, pending) {
+    // Verrouille juste le bouton d'action pendant l'aller-retour serveur,
+    // pour empêcher un double clic d'envoyer deux fois le même ordre.
+    panel.querySelector('.action-btn').disabled = pending;
+    panel.dataset.pending = pending ? 'true' : 'false';
+  }
+
   socket.addEventListener('status', (e) => {
     statusEl.dataset.state = e.detail.state;
+    const connected = e.detail.state === 'connected';
+    setPanelsInteractive(connected);
+    if (!connected) {
+      roundStateEl.textContent =
+        e.detail.state === 'reconnecting' ? 'reconnexion...' :
+        e.detail.state === 'stale' ? 'connexion instable...' :
+        'déconnecté';
+    }
   });
 
   socket.addEventListener('balance', (e) => {
@@ -133,6 +162,16 @@ if (!token) {
 
   socket.addEventListener('serverError', (e) => {
     roundStateEl.textContent = e.detail.reason || 'erreur';
+  });
+
+  socket.addEventListener('sendFailed', () => {
+    roundStateEl.textContent = 'action non envoyée — hors ligne';
+  });
+
+  socket.addEventListener('actionTimeout', (e) => {
+    const panel = document.querySelector(`.bet-panel[data-slot="${e.detail.slot}"]`);
+    if (panel) setPanelPending(panel, false);
+    roundStateEl.textContent = 'pas de réponse serveur — réessaie';
   });
 
   socket.addEventListener('broadcast', (e) => {
@@ -145,7 +184,9 @@ if (!token) {
       zoneEl.classList.remove('crashed');
       roundStartTs = null;
     } else if (type === 'TICK') {
-      if (roundStartTs === null) roundStartTs = performance.now() - (data.elapsedMs || 0);
+      // Resynchronisé à CHAQUE tick (pas juste au premier) pour que la courbe
+      // ne dérive jamais du multiplicateur serveur, qui reste la seule source de vérité.
+      roundStartTs = performance.now() - (data.elapsedMs || 0);
       roundStateEl.textContent = 'en vol';
       multEl.textContent = Number(data.multiplier).toFixed(2) + 'x';
     } else if (type === 'CRASH') {
@@ -162,6 +203,7 @@ if (!token) {
     const { type, data } = e.detail;
     const panel = document.querySelector(`.bet-panel[data-slot="${data.slot}"]`);
     if (!panel) return;
+    setPanelPending(panel, false);
     if (type === 'BET_ACCEPTED') panel.dataset.active = 'true';
     if (type === 'BET_REJECTED') panel.dataset.active = 'false';
     if (type === 'CASHOUT_ACCEPTED' || type === 'CASHOUT_REJECTED') panel.dataset.active = 'false';
@@ -180,12 +222,19 @@ if (!token) {
     });
 
     btn.addEventListener('click', () => {
+      if (panel.dataset.pending === 'true') return; // garde-fou anti double-clic
       if (panel.dataset.active === 'true') {
-        socket.cashout(slot);
+        setPanelPending(panel, true);
+        const sent = socket.cashout(slot);
+        if (!sent) setPanelPending(panel, false);
       } else {
         const amount = Number(amountInput.value);
         const auto = autoInput.value ? Number(autoInput.value) : null;
-        if (amount > 0) socket.bet(slot, amount, auto);
+        if (amount > 0) {
+          setPanelPending(panel, true);
+          const sent = socket.bet(slot, amount, auto);
+          if (!sent) setPanelPending(panel, false);
+        }
       }
     });
   });

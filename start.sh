@@ -1,176 +1,334 @@
 #!/data/data/com.termux/files/usr/bin/bash
-export LC_ALL=C.UTF-8 LANG=C.UTF-8   # FIX racine : sans ca, bash compte les emojis/blocs en OCTETS
 
-clear
-[ -f ~/223Gaming/.env ] && set -a && source ~/223Gaming/.env && set +a
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
 
-R='\e[0m'; W='\e[1;97m'; D='\e[90m'; G='\e[1;92m'; Y='\e[1;93m'; Cy='\e[1;96m'; Bl='\e[1;94m'; M='\e[1;95m'; Or='\e[38;5;208m'; B='\e[1m'; Rd='\e[1;91m'
-mkdir -p bin logs; rm -f logs/*.pid
+PROJECT_DIR="$HOME/223Gaming/223Crash"
+cd "$PROJECT_DIR" || exit 1
 
-pkill -f './bin/server' 2>/dev/null
-sleep 0.3
+HOST="127.0.0.1"
+HTTP_PORT="${HTTP_PORT:-8080}"
+WS_PORT="${WS_PORT:-3000}"
+VERIFY_PORT="${VERIFY_PORT:-8090}"
 
-NOW=$(date "+%Y-%m-%d %H:%M:%S")
+SERVER_BIN="$PROJECT_DIR/bin/server"
+LOG_DIR="$PROJECT_DIR/logs"
+SERVER_LOG="$LOG_DIR/server.log"
+BUILD_LOG="$LOG_DIR/build.log"
+PID_FILE="$LOG_DIR/go.pid"
+
+mkdir -p "$PROJECT_DIR/bin" "$LOG_DIR"
+
+# ============================================================
+# ENV
+# ============================================================
+
+if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    . "$PROJECT_DIR/.env"
+    set +a
+fi
 
 HTTP_PORT="${HTTP_PORT:-8080}"
 WS_PORT="${WS_PORT:-3000}"
 VERIFY_PORT="${VERIFY_PORT:-8090}"
 
-HAS_JQ=0
-command -v jq >/dev/null 2>&1 && HAS_JQ=1
+# ============================================================
+# THÈME 223CRASH
+# ============================================================
 
-WIDE_EMOJI=("👤" "🎓" "⚙️" "📞" "📧" "🌍" "🕒" "🚀" "🎮" "🔐" "🌐")
+R='\033[0m'
+B='\033[1m'
 
-row() {
-  local border_color="$1" content="$2" inner="$3"
-  local stripped="$content"
-  stripped=$(printf '%s' "$stripped" | sed -E 's/\\e\[[0-9;]*m//g')
-  local charcount=${#stripped}
-  local wide=0 e without occ
-  for e in "${WIDE_EMOJI[@]}"; do
-    without=${stripped//$e/}
-    occ=$(( (${#stripped} - ${#without}) / ${#e} ))
-    wide=$(( wide + occ ))
-  done
-  local dispwidth=$(( charcount + wide ))
-  local pad=$(( inner - dispwidth ))
-  (( pad < 0 )) && pad=0
-  printf "%b║%b%*s%b║%b\n" "$border_color" "$content" "$pad" "" "$border_color" "$R"
-  sleep 0.06
-}
+# Structure
+CY='\033[1;96m'
+BL='\033[1;94m'
+WH='\033[1;97m'
 
-bar() { local color="$1" l="$2" fill="$3" r="$4" inner="$5"; printf "%b%s" "$color"; printf "%s" "$l"; local i; for ((i=0;i<inner+2;i++)); do printf "%s" "$fill"; done; printf "%s%b\n" "$r" "$R"; sleep 0.06; }
+# États
+GN='\033[1;92m'
+GO='\033[1;93m'
+RD='\033[1;91m'
 
-a(){ echo -e "$1"; sleep 0.06; }
+# Accent
+MG='\033[1;95m'
 
-INNER1=48
-INNER2=51   # dimensionnee pour le pire cas : port 5 chiffres + code HTTP 3 chiffres
-INNER3=36
+# Texte secondaire
+GR='\033[90m'
 
-bar "$Bl" "╔" "═" "╗" "$INNER1"
-row "$Bl" "${B}${W} 223GAMING STUDIO • LAB iGAMING B2B" "$INNER1"
-row "$Bl" " Produit: ${G}223CRASH ${Y}v2.2.0.56 ${D}[STABLE B2B]" "$INNER1"
-bar "$Bl" "╠" "═" "╣" "$INNER1"
-row "$Bl" "${B}${Y} FONDATEUR & PDG" "$INNER1"
-row "$Bl" " ${W}👤 Nom   : ${B}${Cy}Tidiane Diallo" "$INNER1"
-row "$Bl" " ${W}🎓 Rôle  : ${B}${Y}Architecte Full-Stack Senior" "$INNER1"
-row "$Bl" " ${W}⚙️ Stack : ${B}${G}Go ${W}• ${M}MongoDB ${W}• ${Or}B2B" "$INNER1"
-row "$Bl" " ${W}📞 Tél   : ${B}${Or}(+223) 70 56 05 15" "$INNER1"
-row "$Bl" " ${W}📧 Email : ${B}${W}tidiane.s.diallo@gmail.com" "$INNER1"
-row "$Bl" " ${W}🌍 Pays  : ${B}${G}Mali - Bamako" "$INNER1"
-row "$Bl" " ${D}🕒 Boot  : ${W}${NOW}" "$INNER1"
-bar "$Bl" "╠" "═" "╣" "$INNER1"
-row "$Bl" " 🚀 MOTEUR : ${G}Go 1.22 • net/http • Haute Perf" "$INNER1"
-row "$Bl" " 🎮 JEU    : ${Cy}Crash x5000 • Temps Réel B2B" "$INNER1"
-row "$Bl" " 🔐 ÉQUITÉ : ${Y}SHA256 HMAC • Prouvable Équitable" "$INNER1"
-row "$Bl" " 🌐 LIVE   : ${G}99.9% Uptime • API Gateway" "$INNER1"
-bar "$Bl" "╚" "═" "╝" "$INNER1"
-a ""
+# ============================================================
+# OUTILS
+# ============================================================
 
-bar "$Y" "╔" "═" "╗" "$INNER2"
-row "$Y" "${W} [1/4] Compilation Go" "$INNER2"
+if ! command -v go >/dev/null 2>&1; then
+    echo "Go absent."
+    exit 1
+fi
 
-GOFLAGS="-p=1" GOGC=50 CGO_ENABLED=0 go build -o bin/server ./cmd/server 2>logs/build.log
+if ! command -v curl >/dev/null 2>&1; then
+    echo "curl absent."
+    exit 1
+fi
+
+if [ -z "${MONGO_URI:-}" ]; then
+    echo "MONGO_URI manquant."
+    exit 1
+fi
+
+# ============================================================
+# ARRÊT ANCIEN PROCESSUS (graceful, avec poll — pas de sleep fixe)
+# ============================================================
+
+SHUTDOWN_GRACE_SECS="${SHUTDOWN_GRACE_SECS:-5}"
+
+if [ -f "$PID_FILE" ]; then
+    OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"
+
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        kill "$OLD_PID" 2>/dev/null
+
+        i=0
+        STEPS=$((SHUTDOWN_GRACE_SECS * 10))
+        while [ "$i" -lt "$STEPS" ]; do
+            if ! kill -0 "$OLD_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+            i=$((i + 1))
+        done
+
+        if kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "AVERTISSEMENT: PID $OLD_PID n'a pas terminé proprement en ${SHUTDOWN_GRACE_SECS}s — SIGKILL forcé."
+            echo "Vérifie s'il y avait un round en cours (voir logs/server.log)."
+            kill -9 "$OLD_PID" 2>/dev/null
+        fi
+    fi
+
+    rm -f "$PID_FILE"
+fi
+
+# ============================================================
+# DATE / VERSION
+# ============================================================
+
+BOOT_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+GO_VERSION="$(go version | awk '{print $3}')"
+
+# ============================================================
+# HEADER
+# ============================================================
+
+clear
+
+printf "${CY}╔══════════════════════════════════════════════╗${R}\n"
+printf "${CY}║ ${WH}${B}223GAMING STUDIO${R}${CY} • ${MG}LAB iGAMING B2B${CY}       ║${R}\n"
+printf "${CY}║ ${WH}Produit : ${GO}223CRASH v2.2.0.56${WH} [${GN}STABLE B2B${WH}] ${CY}║${R}\n"
+printf "${CY}╠══════════════════════════════════════════════╣${R}\n"
+printf "${CY}║ ${GO}${B}FONDATEUR & PDG${R}${CY}                             ║${R}\n"
+printf "${CY}║ ${WH}👤 Tidiane Diallo${CY}                           ║${R}\n"
+printf "${CY}║ ${WH}🎓 Architecte Full-Stack Senior${CY}             ║${R}\n"
+printf "${CY}║ ${WH}⚙️  Go • MongoDB • ${GO}B2B${CY}                      ║${R}\n"
+printf "${CY}║ ${WH}🌍 Mali • Bamako${CY}                            ║${R}\n"
+printf "${CY}║ ${WH}🕒 Boot : ${GO}%-31s${CY} ║${R}\n" "$BOOT_TIME"
+printf "${CY}╠══════════════════════════════════════════════╣${R}\n"
+printf "${CY}║ ${BL}🚀 MOTEUR${CY} : ${WH}%-32s ${CY}║${R}\n" "$GO_VERSION"
+printf "${CY}║ ${BL}🎮 JEU${CY}    : ${WH}Crash x5000 • Temps Réel B2B${CY}    ║${R}\n"
+printf "${CY}║ ${BL}🔐 ÉQUITÉ${CY} : ${WH}SHA256 HMAC • ${GN}Provably Fair${WH}     ${CY}║${R}\n"
+printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
+
+# ============================================================
+# [1/4] COMPILATION
+# ============================================================
+
+printf "\n${CY}╔══════════════════════════════════════════════╗${R}\n"
+printf "${CY}║ ${GO}${B}[1/4]${R}${CY} Préparation + Compilation Go          ║${R}\n"
+
+printf "${CY}║   ${GN}✓${R}${WH} MONGO_URI présent${CY}                      ║${R}\n"
+printf "${CY}║   ${GN}✓${R}${WH} MONGO_DB=${MONGO_DB:-223crash}${CY}                    ║${R}\n"
+
+GOFLAGS="-p=1" \
+GOGC=50 \
+CGO_ENABLED=0 \
+go build \
+    -o "$SERVER_BIN" \
+    ./cmd/server \
+    >"$BUILD_LOG" 2>&1
+
 if [ $? -ne 0 ]; then
-  row "$Y" "   ${Rd}✘ ÉCHEC DE COMPILATION" "$INNER2"
-  bar "$Y" "╚" "═" "╝" "$INNER2"
-  echo -e "${Rd}Erreur de compilation — voir logs/build.log:${R}"
-  tail -n 20 logs/build.log
-  exit 1
+    printf "${CY}║   ${RD}✗ COMPILATION ÉCHOUÉE${CY}                   ║${R}\n"
+    printf "${CY}║   ${RD}Voir logs/build.log${CY}                     ║${R}\n"
+    printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
+    exit 1
 fi
-row "$Y" "   ${G}Go binaire  ██████████ ✔ COMPILÉ" "$INNER2"
 
-nohup ./bin/server >logs/server.log 2>&1 &
-echo $! >logs/go.pid
-PID=$(cat logs/go.pid)
+printf "${CY}║   ${GN}✓ Go binaire • COMPILÉ${CY}                   ║${R}\n"
+printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
 
-row "$Y" "" "$INNER2"
-row "$Y" "${W} [2/4] Démarrage du processus" "$INNER2"
+# ============================================================
+# [2/4] DÉMARRAGE
+# ============================================================
 
-sleep 0.8
-if ! kill -0 "$PID" 2>/dev/null; then
-  row "$Y" "   ${Rd}✘ PROCESSUS ARRÊTÉ (PID $PID)" "$INNER2"
-  bar "$Y" "╚" "═" "╝" "$INNER2"
-  echo -e "${Rd}Le processus a échoué au démarrage — voir logs/server.log:${R}"
-  tail -n 20 logs/server.log
-  exit 1
+printf "\n${CY}╔══════════════════════════════════════════════╗${R}\n"
+printf "${CY}║ ${GO}${B}[2/4]${R}${CY} Démarrage du processus               ║${R}\n"
+
+nohup "$SERVER_BIN" >"$SERVER_LOG" 2>&1 &
+PID=$!
+
+echo "$PID" >"$PID_FILE"
+
+sleep 0.5
+
+if kill -0 "$PID" 2>/dev/null; then
+    printf "${CY}║   ${GN}✓${R}${WH} Processus • PID ${GO}%-18s${CY}║${R}\n" "$PID"
+else
+    printf "${CY}║   ${RD}✗ Processus arrêté${CY}                      ║${R}\n"
+    printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
+    exit 1
 fi
-row "$Y" "   ${G}Processus   ██████████ ✔ PID $PID" "$INNER2"
 
-row "$Y" "" "$INNER2"
-row "$Y" "${W} [3/4] Vérification HTTP + MongoDB" "$INNER2"
+printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
 
-HC_JSON=""
+# ============================================================
+# [3/4] HTTP + MONGODB
+# ============================================================
+
+printf "\n${CY}╔══════════════════════════════════════════════╗${R}\n"
+printf "${CY}║ ${GO}${B}[3/4]${R}${CY} Vérification HTTP + MongoDB         ║${R}\n"
+printf "${CY}║   ${BL}Adresse${CY} : ${WH}${HOST}${CY}                         ║${R}\n"
+printf "${CY}║   ${BL}Health${CY}  : ${WH}/healthz${CY}                        ║${R}\n"
+
 HC_OK=0
-for i in 1 2 3 4 5 6 7 8; do
-  HC_JSON=$(curl -s -m 2 "http://localhost:${HTTP_PORT}/healthz" 2>/dev/null)
-  if [ -n "$HC_JSON" ]; then
-    HC_OK=1
-    break
-  fi
-  sleep 0.5
+HC_CODE="000"
+HC_JSON=""
+
+for i in $(seq 1 24); do
+
+    RAW="$(
+        curl \
+            -sS \
+            --connect-timeout 1 \
+            --max-time 2 \
+            -w '\n%{http_code}' \
+            "http://${HOST}:${HTTP_PORT}/healthz" \
+            2>/dev/null
+    )"
+
+    HC_CODE="${RAW##*$'\n'}"
+    HC_JSON="${RAW%$'\n'*}"
+
+    if [ "$HC_CODE" = "200" ]; then
+        HC_OK=1
+        break
+    fi
+
+    if ! kill -0 "$PID" 2>/dev/null; then
+        break
+    fi
+
+    sleep 0.5
 done
 
-MONGO_STATE="unknown"
 APP_STATE="unknown"
+MONGO_STATE="unknown"
+
 if [ "$HC_OK" -eq 1 ]; then
-  if [ "$HAS_JQ" -eq 1 ]; then
-    APP_STATE=$(echo "$HC_JSON" | jq -r '.status // "unknown"')
-    MONGO_STATE=$(echo "$HC_JSON" | jq -r '.mongo // "unknown"')
-  else
-    APP_STATE=$(echo "$HC_JSON" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
-    MONGO_STATE=$(echo "$HC_JSON" | grep -o '"mongo":"[^"]*"' | cut -d'"' -f4)
-  fi
+
+    if command -v jq >/dev/null 2>&1; then
+        APP_STATE="$(printf '%s' "$HC_JSON" | jq -r '.status // "unknown"' 2>/dev/null)"
+        MONGO_STATE="$(printf '%s' "$HC_JSON" | jq -r '.mongo // "unknown"' 2>/dev/null)"
+    else
+        APP_STATE="$(printf '%s' "$HC_JSON" |
+            sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+
+        MONGO_STATE="$(printf '%s' "$HC_JSON" |
+            sed -n 's/.*"mongo":"\([^"]*\)".*/\1/p')"
+    fi
 fi
 
 if [ "$HC_OK" -eq 1 ] && [ "$APP_STATE" = "ok" ]; then
-  row "$Y" "   ${G}HTTP ${HTTP_PORT}   ██████████ ✔ RÉPOND" "$INNER2"
+    printf "${CY}║   ${GN}✓${R}${WH} HTTP %s • OK (${GN}%s${WH})${CY}                 ║${R}\n" "$HTTP_PORT" "$HC_CODE"
 else
-  row "$Y" "   ${Rd}HTTP ${HTTP_PORT}   ✘ PAS DE RÉPONSE" "$INNER2"
+    printf "${CY}║   ${RD}✗${R}${WH} HTTP %s • DOWN${CY}                     ║${R}\n" "$HTTP_PORT"
 fi
 
 if [ "$MONGO_STATE" = "connected" ]; then
-  row "$Y" "   ${G}MongoDB      ██████████ ✔ CONNECTÉ" "$INNER2"
-elif [ "$MONGO_STATE" = "down" ]; then
-  row "$Y" "   ${Rd}MongoDB      ✘ DÉCONNECTÉ" "$INNER2"
+    printf "${CY}║   ${GN}✓${R}${WH} MongoDB • ${GN}CONNECTÉ${WH}                   ║${R}\n"
 else
-  row "$Y" "   ${Rd}MongoDB      ? INDÉTERMINÉ" "$INNER2"
+    printf "${CY}║   ${RD}✗${R}${WH} MongoDB • ${RD}DOWN${WH}                       ║${R}\n"
 fi
 
-row "$Y" "" "$INNER2"
-row "$Y" "${W} [4/4] Services réseau" "$INNER2"
+printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
 
-WS_CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 1 "http://localhost:${WS_PORT}/" 2>/dev/null)
-if [ "$WS_CODE" != "000" ] && [ -n "$WS_CODE" ]; then
-  row "$Y" "   ${G}WS   ${WS_PORT}   ██████████ ✔ EN ÉCOUTE (HTTP ${WS_CODE})" "$INNER2"
+# ============================================================
+# [4/4] SERVICES RÉSEAU
+# ============================================================
+
+printf "\n${CY}╔══════════════════════════════════════════════╗${R}\n"
+printf "${CY}║ ${GO}${B}[4/4]${R}${CY} Services réseau                     ║${R}\n"
+
+WS_CODE="$(
+    curl \
+        -sS \
+        -o /dev/null \
+        -w '%{http_code}' \
+        --connect-timeout 1 \
+        --max-time 2 \
+        "http://${HOST}:${WS_PORT}/" \
+        2>/dev/null
+)"
+
+if [ -n "$WS_CODE" ] && [ "$WS_CODE" != "000" ]; then
+    printf "${CY}║   ${GN}✓${R}${WH} WS %s • EN ÉCOUTE (${GN}%s${WH})${CY}              ║${R}\n" "$WS_PORT" "$WS_CODE"
+    WS_OK=1
 else
-  row "$Y" "   ${Rd}WS   ${WS_PORT}   ✘ INJOIGNABLE" "$INNER2"
+    printf "${CY}║   ${RD}✗${R}${WH} WS %s • ${RD}DOWN${WH}                        ║${R}\n" "$WS_PORT"
+    WS_OK=0
 fi
 
-VERIFY_OK=0
-curl -sf -o /dev/null -m 1 "http://localhost:${VERIFY_PORT}/verify/ping" 2>/dev/null && VERIFY_OK=1
-if [ "$VERIFY_OK" -eq 1 ]; then
-  row "$Y" "   ${G}Vérif. ${VERIFY_PORT} ██████████ ✔ RÉPOND" "$INNER2"
+VERIFY_CODE="$(
+    curl \
+        -sS \
+        -o /dev/null \
+        -w '%{http_code}' \
+        --connect-timeout 1 \
+        --max-time 2 \
+        "http://${HOST}:${VERIFY_PORT}/verify/ping" \
+        2>/dev/null
+)"
+
+if [ "$VERIFY_CODE" = "200" ]; then
+    printf "${CY}║   ${GN}✓${R}${WH} Vérif. %s • ${GN}RÉPOND${WH} (${GN}%s${WH})${CY}            ║${R}\n" "$VERIFY_PORT" "$VERIFY_CODE"
+    VERIFY_OK=1
 else
-  row "$Y" "   ${Rd}Vérif. ${VERIFY_PORT} ✘ PAS DE RÉPONSE" "$INNER2"
+    printf "${CY}║   ${RD}✗${R}${WH} Vérif. %s • ${RD}DOWN${WH}                     ║${R}\n" "$VERIFY_PORT"
+    VERIFY_OK=0
 fi
 
-bar "$Y" "╚" "═" "╝" "$INNER2"
-a ""
+printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
 
-ALL_OK=0
-if [ "$HC_OK" -eq 1 ] && [ "$APP_STATE" = "ok" ] && [ "$MONGO_STATE" = "connected" ]; then
-  ALL_OK=1
-fi
+# ============================================================
+# VERDICT FINAL
+# ============================================================
 
-if [ "$ALL_OK" -eq 1 ]; then
-  bar "$G" "┏" "━" "┓" "$INNER3"
-  row "$G" "${B}${W} MOTEUR EN LIGNE • PID $PID" "$INNER3"
-  row "$G" "${W} HTTP OK • MONGO OK • COMPILATION OK" "$INNER3"
-  bar "$G" "┗" "━" "┛" "$INNER3"
+if [ "$HC_OK" -eq 1 ] &&
+   [ "$APP_STATE" = "ok" ] &&
+   [ "$MONGO_STATE" = "connected" ] &&
+   [ "$WS_OK" -eq 1 ] &&
+   [ "$VERIFY_OK" -eq 1 ]; then
+
+    printf "\n${GN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${R}\n"
+    printf "${GN}┃ ${WH}MOTEUR EN LIGNE • PID ${GO}%-10s${GN} ┃${R}\n" "$PID"
+    printf "${GN}┃ ${WH}HTTP ${GN}OK${WH} • MONGO ${GN}OK${WH} • WS ${GN}OK${WH}          ${GN}┃${R}\n"
+    printf "${GN}┃ ${WH}VERIFY ${GN}OK${WH} • COMPILATION ${GN}OK${WH}          ${GN}┃${R}\n"
+    printf "${GN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${R}\n"
+
+    exit 0
 else
-  bar "$Rd" "┏" "━" "┓" "$INNER3"
-  row "$Rd" " DÉGRADÉ • VOIR DÉTAIL CI-DESSUS" "$INNER3"
-  bar "$Rd" "┗" "━" "┛" "$INNER3"
+
+    printf "\n${GO}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${R}\n"
+    printf "${GO}┃ ${WH}MOTEUR • VÉRIFICATION REQUISE        ${GO}┃${R}\n"
+    printf "${GO}┃ ${WH}Consulte logs/server.log              ${GO}┃${R}\n"
+    printf "${GO}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${R}\n"
+
+    exit 1
 fi
-echo ""

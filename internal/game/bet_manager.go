@@ -31,7 +31,6 @@ const (
 	BetLost      BetState = "LOST"
 )
 
-// BetPanel identifie l'un des 4 panels de mise simultanés par joueur (clone JetX Dual x4).
 type BetPanel uint8
 
 const (
@@ -41,7 +40,6 @@ const (
 	Panel4 BetPanel = 4
 )
 
-// MaxBetPanels est le nombre de panels de mise simultanés autorisés par joueur.
 const MaxBetPanels = 4
 
 func (p BetPanel) IsValid() bool {
@@ -159,7 +157,6 @@ func (bm *BetManager) StartRound() error {
 	return nil
 }
 
-// PlaceBet pose une mise sur l'un des 4 panels du joueur. Un seul pari actif par panel.
 func (bm *BetManager) PlaceBet(
 	userID string,
 	panel BetPanel,
@@ -225,13 +222,6 @@ func (bm *BetManager) PlaceBet(
 	return cloneBet(bet), nil
 }
 
-// Cashout reçoit UNIQUEMENT le bet ID et le multiplicateur
-// fourni par le moteur autoritaire.
-//
-// Le client ne doit jamais fournir currentMultiplier directement.
-//
-// Le CrashEngine appelle cette méthode avec son propre
-// multiplicateur courant.
 func (bm *BetManager) Cashout(
 	betID string,
 	currentMultiplier float64,
