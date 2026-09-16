@@ -1,334 +1,477 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-export LC_ALL=C.UTF-8
-export LANG=C.UTF-8
-
-PROJECT_DIR="$HOME/223Gaming/223Crash"
-cd "$PROJECT_DIR" || exit 1
-
-HOST="127.0.0.1"
-HTTP_PORT="${HTTP_PORT:-8080}"
-WS_PORT="${WS_PORT:-3000}"
-VERIFY_PORT="${VERIFY_PORT:-8090}"
-
-SERVER_BIN="$PROJECT_DIR/bin/server"
-LOG_DIR="$PROJECT_DIR/logs"
-SERVER_LOG="$LOG_DIR/server.log"
-BUILD_LOG="$LOG_DIR/build.log"
-PID_FILE="$LOG_DIR/go.pid"
-
-mkdir -p "$PROJECT_DIR/bin" "$LOG_DIR"
+set -Eeuo pipefail
 
 # ============================================================
-# ENV
+# 223GAMING STUDIO
+# STARTUP ORCHESTRATOR
+# Provider Core + Game Products
 # ============================================================
 
-if [ -f "$PROJECT_DIR/.env" ]; then
+PROJECT_DIR="${HOME}/223Gaming/223Crash"
+cd "$PROJECT_DIR"
+
+# ============================================================
+# COLORS
+# ============================================================
+
+if [[ -t 1 ]]; then
+    RESET=$'\033[0m'
+    BOLD=$'\033[1m'
+    RED=$'\033[31m'
+    GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'
+    BLUE=$'\033[34m'
+    MAGENTA=$'\033[35m'
+    CYAN=$'\033[36m'
+    WHITE=$'\033[37m'
+else
+    RESET=""
+    BOLD=""
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    MAGENTA=""
+    CYAN=""
+    WHITE=""
+fi
+
+# Compatibility alias used by the Studio header.
+CY="$CYAN"
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
+if [[ -f "$PROJECT_DIR/.env" ]]; then
     set -a
-    . "$PROJECT_DIR/.env"
+    # shellcheck disable=SC1091
+    source "$PROJECT_DIR/.env"
     set +a
 fi
 
+HOST="${HOST:-127.0.0.1}"
+
 HTTP_PORT="${HTTP_PORT:-8080}"
 WS_PORT="${WS_PORT:-3000}"
 VERIFY_PORT="${VERIFY_PORT:-8090}"
+MOCKWALLET_PORT="${MOCKWALLET_PORT:-9000}"
+
+START_MOCKWALLET="${START_MOCKWALLET:-0}"
 
 # ============================================================
-# THÈME 223CRASH
+# DIRECTORIES
 # ============================================================
 
-R='\033[0m'
-B='\033[1m'
+BIN_DIR="$PROJECT_DIR/bin"
+LOG_DIR="$PROJECT_DIR/logs"
+RUNTIME_DIR="$PROJECT_DIR/.runtime"
+PID_DIR="$RUNTIME_DIR/pids"
 
-# Structure
-CY='\033[1;96m'
-BL='\033[1;94m'
-WH='\033[1;97m'
-
-# États
-GN='\033[1;92m'
-GO='\033[1;93m'
-RD='\033[1;91m'
-
-# Accent
-MG='\033[1;95m'
-
-# Texte secondaire
-GR='\033[90m'
+mkdir -p \
+    "$BIN_DIR" \
+    "$LOG_DIR" \
+    "$PID_DIR"
 
 # ============================================================
-# OUTILS
+# PID FILES
 # ============================================================
 
-if ! command -v go >/dev/null 2>&1; then
-    echo "Go absent."
+PROVIDER_PID_FILE="$PID_DIR/provider-server.pid"
+MOCKWALLET_PID_FILE="$PID_DIR/mockwallet.pid"
+
+# ============================================================
+# LOG FILES
+# ============================================================
+
+PROVIDER_LOG="$LOG_DIR/provider-server.log"
+MOCKWALLET_LOG="$LOG_DIR/mockwallet.log"
+BUILD_LOG="$LOG_DIR/build.log"
+MOCK_BUILD_LOG="$LOG_DIR/build-mockwallet.log"
+
+# ============================================================
+# BINARIES
+# ============================================================
+
+SERVER_BIN="$BIN_DIR/server"
+MOCKWALLET_BIN="$BIN_DIR/mockwallet"
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+die() {
+    printf "\n${RED}${BOLD}ERROR:${RESET} %s\n" "$*" >&2
     exit 1
-fi
+}
 
-if ! command -v curl >/dev/null 2>&1; then
-    echo "curl absent."
-    exit 1
-fi
+info() {
+    printf "${CYAN}▸${RESET} %s\n" "$*"
+}
 
-if [ -z "${MONGO_URI:-}" ]; then
-    echo "MONGO_URI manquant."
-    exit 1
-fi
+success() {
+    printf "${GREEN}✓${RESET} %s\n" "$*"
+}
 
-# ============================================================
-# ARRÊT ANCIEN PROCESSUS (graceful, avec poll — pas de sleep fixe)
-# ============================================================
+warn() {
+    printf "${YELLOW}⚠${RESET} %s\n" "$*"
+}
 
-SHUTDOWN_GRACE_SECS="${SHUTDOWN_GRACE_SECS:-5}"
+section() {
+    printf "\n${BLUE}${BOLD}== %s ==${RESET}\n" "$*"
+}
 
-if [ -f "$PID_FILE" ]; then
-    OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"
+pid_alive() {
+    local pid="$1"
 
-    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-        kill "$OLD_PID" 2>/dev/null
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
 
-        i=0
-        STEPS=$((SHUTDOWN_GRACE_SECS * 10))
-        while [ "$i" -lt "$STEPS" ]; do
-            if ! kill -0 "$OLD_PID" 2>/dev/null; then
-                break
-            fi
-            sleep 0.1
-            i=$((i + 1))
-        done
+pid_matches_binary() {
+    local pid="$1"
+    local expected="$2"
 
-        if kill -0 "$OLD_PID" 2>/dev/null; then
-            echo "AVERTISSEMENT: PID $OLD_PID n'a pas terminé proprement en ${SHUTDOWN_GRACE_SECS}s — SIGKILL forcé."
-            echo "Vérifie s'il y avait un round en cours (voir logs/server.log)."
-            kill -9 "$OLD_PID" 2>/dev/null
-        fi
+    pid_alive "$pid" || return 1
+
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+
+    local cmdline
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+
+    [[ "$cmdline" == *"$expected"* ]]
+}
+
+read_pid() {
+    local pid_file="$1"
+
+    [[ -f "$pid_file" ]] || return 1
+
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    printf '%s' "$pid"
+}
+
+cleanup_stale_pid() {
+    local pid_file="$1"
+    local expected_binary="$2"
+
+    if [[ ! -f "$pid_file" ]]; then
+        return 0
     fi
 
-    rm -f "$PID_FILE"
-fi
+    local pid
+    pid="$(read_pid "$pid_file" || true)"
 
-# ============================================================
-# DATE / VERSION
-# ============================================================
+    if [[ -z "$pid" ]]; then
+        rm -f "$pid_file"
+        return 0
+    fi
 
-BOOT_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
-GO_VERSION="$(go version | awk '{print $3}')"
+    if pid_matches_binary "$pid" "$expected_binary"; then
+        die "Process already running: $expected_binary (PID $pid)"
+    fi
+
+    rm -f "$pid_file"
+}
+
+wait_for_http() {
+    local url="$1"
+    local attempts="${2:-30}"
+
+    local i
+    for ((i=1; i<=attempts; i++)); do
+        if curl -fsS --max-time 1 "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    return 1
+}
+
+port_reachable() {
+    local host="$1"
+    local port="$2"
+
+    if command -v nc >/dev/null 2>&1; then
+        nc -z "$host" "$port" >/dev/null 2>&1
+        return $?
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        curl \
+            --silent \
+            --output /dev/null \
+            --max-time 1 \
+            "http://${host}:${port}/" >/dev/null 2>&1
+
+        return $?
+    fi
+
+    return 1
+}
 
 # ============================================================
 # HEADER
 # ============================================================
 
-clear
+clear 2>/dev/null || true
 
-printf "${CY}╔══════════════════════════════════════════════╗${R}\n"
-printf "${CY}║ ${WH}${B}223GAMING STUDIO${R}${CY} • ${MG}LAB iGAMING B2B${CY}       ║${R}\n"
-printf "${CY}║ ${WH}Produit : ${GO}223CRASH v2.2.0.56${WH} [${GN}STABLE B2B${WH}] ${CY}║${R}\n"
-printf "${CY}╠══════════════════════════════════════════════╣${R}\n"
-printf "${CY}║ ${GO}${B}FONDATEUR & PDG${R}${CY}                             ║${R}\n"
-printf "${CY}║ ${WH}👤 Tidiane Diallo${CY}                           ║${R}\n"
-printf "${CY}║ ${WH}🎓 Architecte Full-Stack Senior${CY}             ║${R}\n"
-printf "${CY}║ ${WH}⚙️  Go • MongoDB • ${GO}B2B${CY}                      ║${R}\n"
-printf "${CY}║ ${WH}🌍 Mali • Bamako${CY}                            ║${R}\n"
-printf "${CY}║ ${WH}🕒 Boot : ${GO}%-31s${CY} ║${R}\n" "$BOOT_TIME"
-printf "${CY}╠══════════════════════════════════════════════╣${R}\n"
-printf "${CY}║ ${BL}🚀 MOTEUR${CY} : ${WH}%-32s ${CY}║${R}\n" "$GO_VERSION"
-printf "${CY}║ ${BL}🎮 JEU${CY}    : ${WH}Crash x5000 • Temps Réel B2B${CY}    ║${R}\n"
-printf "${CY}║ ${BL}🔐 ÉQUITÉ${CY} : ${WH}SHA256 HMAC • ${GN}Provably Fair${WH}     ${CY}║${R}\n"
-printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
+BOOT_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# ============================================================
-# [1/4] COMPILATION
-# ============================================================
-
-printf "\n${CY}╔══════════════════════════════════════════════╗${R}\n"
-printf "${CY}║ ${GO}${B}[1/4]${R}${CY} Préparation + Compilation Go          ║${R}\n"
-
-printf "${CY}║   ${GN}✓${R}${WH} MONGO_URI présent${CY}                      ║${R}\n"
-printf "${CY}║   ${GN}✓${R}${WH} MONGO_DB=${MONGO_DB:-223crash}${CY}                    ║${R}\n"
-
-GOFLAGS="-p=1" \
-GOGC=50 \
-CGO_ENABLED=0 \
-go build \
-    -o "$SERVER_BIN" \
-    ./cmd/server \
-    >"$BUILD_LOG" 2>&1
-
-if [ $? -ne 0 ]; then
-    printf "${CY}║   ${RD}✗ COMPILATION ÉCHOUÉE${CY}                   ║${R}\n"
-    printf "${CY}║   ${RD}Voir logs/build.log${CY}                     ║${R}\n"
-    printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
-    exit 1
-fi
-
-printf "${CY}║   ${GN}✓ Go binaire • COMPILÉ${CY}                   ║${R}\n"
-printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
-
-# ============================================================
-# [2/4] DÉMARRAGE
-# ============================================================
-
-printf "\n${CY}╔══════════════════════════════════════════════╗${R}\n"
-printf "${CY}║ ${GO}${B}[2/4]${R}${CY} Démarrage du processus               ║${R}\n"
-
-nohup "$SERVER_BIN" >"$SERVER_LOG" 2>&1 &
-PID=$!
-
-echo "$PID" >"$PID_FILE"
-
-sleep 0.5
-
-if kill -0 "$PID" 2>/dev/null; then
-    printf "${CY}║   ${GN}✓${R}${WH} Processus • PID ${GO}%-18s${CY}║${R}\n" "$PID"
+if command -v go >/dev/null 2>&1; then
+    GO_VERSION="$(go version | awk '{print $3}')"
 else
-    printf "${CY}║   ${RD}✗ Processus arrêté${CY}                      ║${R}\n"
-    printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
-    exit 1
+    GO_VERSION="absent"
 fi
 
-printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
+printf "\n"
+printf "${CY}╔══════════════════════════════════════════════════════╗${RESET}\n"
+printf "${CY}║ ${WHITE}${BOLD}223GAMING STUDIO${RESET}${CY} • ${MAGENTA}LAB iGAMING B2B${CY}             ║${RESET}\n"
+printf "${CY}║ ${WHITE}Provider Core + Game Products${CY}                    ║${RESET}\n"
+printf "${CY}╠══════════════════════════════════════════════════════╣${RESET}\n"
+printf "${CY}║ ${YELLOW}${BOLD}FOUNDER & CEO${RESET}${CY}                                  ║${RESET}\n"
+printf "${CY}║ ${WHITE}Tidiane Diallo${CY}                                  ║${RESET}\n"
+printf "${CY}║ ${WHITE}Moteur : Go${CY}                                      ║${RESET}\n"
+printf "${CY}║ ${WHITE}Architecture : Provider B2B${CY}                     ║${RESET}\n"
+printf "${CY}║ ${WHITE}Boot : %-41s${CY} ║${RESET}\n" "$BOOT_TIME"
+printf "${CY}╚══════════════════════════════════════════════════════╝${RESET}\n"
+printf "\n"
 
 # ============================================================
-# [3/4] HTTP + MONGODB
+# PRECHECK
 # ============================================================
 
-printf "\n${CY}╔══════════════════════════════════════════════╗${R}\n"
-printf "${CY}║ ${GO}${B}[3/4]${R}${CY} Vérification HTTP + MongoDB         ║${R}\n"
-printf "${CY}║   ${BL}Adresse${CY} : ${WH}${HOST}${CY}                         ║${R}\n"
-printf "${CY}║   ${BL}Health${CY}  : ${WH}/healthz${CY}                        ║${R}\n"
+section "PRECHECK"
 
-HC_OK=0
-HC_CODE="000"
-HC_JSON=""
+[[ -d "$PROJECT_DIR" ]] || die "Project directory not found: $PROJECT_DIR"
 
-for i in $(seq 1 24); do
+command -v go >/dev/null 2>&1 \
+    || die "Go is not installed."
 
-    RAW="$(
-        curl \
-            -sS \
-            --connect-timeout 1 \
-            --max-time 2 \
-            -w '\n%{http_code}' \
-            "http://${HOST}:${HTTP_PORT}/healthz" \
-            2>/dev/null
-    )"
+command -v curl >/dev/null 2>&1 \
+    || die "curl is required."
 
-    HC_CODE="${RAW##*$'\n'}"
-    HC_JSON="${RAW%$'\n'*}"
+success "Project : $PROJECT_DIR"
+success "Go      : $GO_VERSION"
 
-    if [ "$HC_CODE" = "200" ]; then
-        HC_OK=1
-        break
+# ============================================================
+# STOP DUPLICATE INSTANCES
+# ============================================================
+
+section "PROCESS CHECK"
+
+cleanup_stale_pid "$PROVIDER_PID_FILE" "$SERVER_BIN"
+
+if [[ "$START_MOCKWALLET" == "1" ]]; then
+    cleanup_stale_pid "$MOCKWALLET_PID_FILE" "$MOCKWALLET_BIN"
+else
+    if [[ -f "$MOCKWALLET_PID_FILE" ]]; then
+        warn "MockWallet PID file exists but START_MOCKWALLET=0."
+        rm -f "$MOCKWALLET_PID_FILE"
+    fi
+fi
+
+success "No conflicting Studio process detected."
+
+# ============================================================
+# BUILD CONFIGURATION
+# ============================================================
+
+export GOFLAGS="${GOFLAGS:--p=1}"
+export GOGC="${GOGC:-50}"
+export CGO_ENABLED="${CGO_ENABLED:-0}"
+
+section "BUILD CONFIGURATION"
+
+printf "  GOFLAGS      = %s\n" "$GOFLAGS"
+printf "  GOGC         = %s\n" "$GOGC"
+printf "  CGO_ENABLED  = %s\n" "$CGO_ENABLED"
+
+# ============================================================
+# BUILD PROVIDER + CURRENT GAME PRODUCTS
+# ============================================================
+
+section "BUILD PROVIDER CORE"
+
+info "Building ./cmd/server ..."
+
+if ! go build -p=1 -o "$SERVER_BIN" ./cmd/server >"$BUILD_LOG" 2>&1; then
+    cat "$BUILD_LOG" >&2
+    die "Provider build failed."
+fi
+
+chmod +x "$SERVER_BIN"
+
+success "Provider binary ready: $SERVER_BIN"
+
+# ============================================================
+# OPTIONAL MOCK WALLET
+# ============================================================
+
+if [[ "$START_MOCKWALLET" == "1" ]]; then
+
+    section "BUILD MOCK WALLET"
+
+    info "Building ./cmd/mockwallet ..."
+
+    if ! go build -p=1 -o "$MOCKWALLET_BIN" ./cmd/mockwallet >"$MOCK_BUILD_LOG" 2>&1; then
+        cat "$MOCK_BUILD_LOG" >&2
+        die "MockWallet build failed."
     fi
 
-    if ! kill -0 "$PID" 2>/dev/null; then
-        break
+    chmod +x "$MOCKWALLET_BIN"
+
+    success "MockWallet binary ready: $MOCKWALLET_BIN"
+
+else
+
+    info "MockWallet disabled."
+    info "Use: START_MOCKWALLET=1 ./start.sh"
+
+fi
+
+# ============================================================
+# START PROVIDER
+# ============================================================
+
+section "START PROVIDER CORE"
+
+info "HTTP    : $HOST:$HTTP_PORT"
+info "WebSocket: $HOST:$WS_PORT"
+info "Verify  : $HOST:$VERIFY_PORT"
+
+nohup "$SERVER_BIN" \
+    >>"$PROVIDER_LOG" 2>&1 &
+
+PROVIDER_PID="$!"
+
+printf '%s\n' "$PROVIDER_PID" >"$PROVIDER_PID_FILE"
+
+sleep 1
+
+if ! pid_matches_binary "$PROVIDER_PID" "$SERVER_BIN"; then
+    warn "Provider process exited during startup."
+
+    tail -n 80 "$PROVIDER_LOG" >&2 || true
+
+    rm -f "$PROVIDER_PID_FILE"
+
+    die "Provider failed to start."
+fi
+
+success "Provider started — PID $PROVIDER_PID"
+
+# ============================================================
+# HEALTH CHECKS
+# ============================================================
+
+section "HEALTH CHECKS"
+
+info "Checking HTTP health..."
+
+if wait_for_http "http://${HOST}:${HTTP_PORT}/healthz" 30; then
+    success "HTTP /healthz ............. OK"
+else
+    tail -n 80 "$PROVIDER_LOG" >&2 || true
+    die "HTTP health check failed."
+fi
+
+info "Checking verification endpoint..."
+
+if wait_for_http "http://${HOST}:${VERIFY_PORT}/verify/ping" 30; then
+    success "Verify /verify/ping ........ OK"
+else
+    tail -n 80 "$PROVIDER_LOG" >&2 || true
+    die "Verify health check failed."
+fi
+
+info "Checking WebSocket port..."
+
+if port_reachable "$HOST" "$WS_PORT"; then
+    success "WebSocket :$WS_PORT ............ REACHABLE"
+else
+    warn "WebSocket port could not be verified with available tools."
+fi
+
+# ============================================================
+# MOCK WALLET START
+# ============================================================
+
+if [[ "$START_MOCKWALLET" == "1" ]]; then
+
+    section "START MOCK WALLET"
+
+    nohup "$MOCKWALLET_BIN" \
+        >>"$MOCKWALLET_LOG" 2>&1 &
+
+    MOCK_PID="$!"
+
+    printf '%s\n' "$MOCK_PID" >"$MOCKWALLET_PID_FILE"
+
+    sleep 1
+
+    if ! pid_matches_binary "$MOCK_PID" "$MOCKWALLET_BIN"; then
+        warn "MockWallet failed to start."
+        tail -n 80 "$MOCKWALLET_LOG" >&2 || true
+        rm -f "$MOCKWALLET_PID_FILE"
+        die "MockWallet startup failed."
     fi
 
-    sleep 0.5
-done
+    success "MockWallet started — PID $MOCK_PID"
 
-APP_STATE="unknown"
-MONGO_STATE="unknown"
+    if wait_for_http \
+        "http://${HOST}:${MOCKWALLET_PORT}/wallet/balance?operatorId=default&playerId=demo" \
+        20; then
 
-if [ "$HC_OK" -eq 1 ]; then
+        success "MockWallet :$MOCKWALLET_PORT ........ OK"
 
-    if command -v jq >/dev/null 2>&1; then
-        APP_STATE="$(printf '%s' "$HC_JSON" | jq -r '.status // "unknown"' 2>/dev/null)"
-        MONGO_STATE="$(printf '%s' "$HC_JSON" | jq -r '.mongo // "unknown"' 2>/dev/null)"
     else
-        APP_STATE="$(printf '%s' "$HC_JSON" |
-            sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
 
-        MONGO_STATE="$(printf '%s' "$HC_JSON" |
-            sed -n 's/.*"mongo":"\([^"]*\)".*/\1/p')"
+        warn "MockWallet HTTP check failed."
+        warn "Provider remains running; inspect $MOCKWALLET_LOG"
+
     fi
-fi
 
-if [ "$HC_OK" -eq 1 ] && [ "$APP_STATE" = "ok" ]; then
-    printf "${CY}║   ${GN}✓${R}${WH} HTTP %s • OK (${GN}%s${WH})${CY}                 ║${R}\n" "$HTTP_PORT" "$HC_CODE"
-else
-    printf "${CY}║   ${RD}✗${R}${WH} HTTP %s • DOWN${CY}                     ║${R}\n" "$HTTP_PORT"
 fi
-
-if [ "$MONGO_STATE" = "connected" ]; then
-    printf "${CY}║   ${GN}✓${R}${WH} MongoDB • ${GN}CONNECTÉ${WH}                   ║${R}\n"
-else
-    printf "${CY}║   ${RD}✗${R}${WH} MongoDB • ${RD}DOWN${WH}                       ║${R}\n"
-fi
-
-printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
 
 # ============================================================
-# [4/4] SERVICES RÉSEAU
+# FINAL STATUS
 # ============================================================
 
-printf "\n${CY}╔══════════════════════════════════════════════╗${R}\n"
-printf "${CY}║ ${GO}${B}[4/4]${R}${CY} Services réseau                     ║${R}\n"
+printf "\n"
+printf "${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗${RESET}\n"
+printf "${GREEN}${BOLD}║              223GAMING STUDIO ONLINE                ║${RESET}\n"
+printf "${GREEN}${BOLD}╠══════════════════════════════════════════════════════╣${RESET}\n"
+printf "${GREEN}║${RESET} Provider Core      : ${GREEN}ONLINE${RESET}                     ${GREEN}║${RESET}\n"
+printf "${GREEN}║${RESET} 223CRASH           : ${GREEN}ACTIVE${RESET}                     ${GREEN}║${RESET}\n"
+printf "${GREEN}║${RESET} HTTP               : ${WHITE}:%-4s${RESET}                     ${GREEN}║${RESET}\n" "$HTTP_PORT"
+printf "${GREEN}║${RESET} WebSocket          : ${WHITE}:%-4s${RESET}                     ${GREEN}║${RESET}\n" "$WS_PORT"
+printf "${GREEN}║${RESET} Verify             : ${WHITE}:%-4s${RESET}                     ${GREEN}║${RESET}\n" "$VERIFY_PORT"
 
-WS_CODE="$(
-    curl \
-        -sS \
-        -o /dev/null \
-        -w '%{http_code}' \
-        --connect-timeout 1 \
-        --max-time 2 \
-        "http://${HOST}:${WS_PORT}/" \
-        2>/dev/null
-)"
-
-if [ -n "$WS_CODE" ] && [ "$WS_CODE" != "000" ]; then
-    printf "${CY}║   ${GN}✓${R}${WH} WS %s • EN ÉCOUTE (${GN}%s${WH})${CY}              ║${R}\n" "$WS_PORT" "$WS_CODE"
-    WS_OK=1
+if [[ "$START_MOCKWALLET" == "1" ]]; then
+    printf "${GREEN}║${RESET} MockWallet         : ${YELLOW}DEV :%-4s${RESET}                  ${GREEN}║${RESET}\n" "$MOCKWALLET_PORT"
 else
-    printf "${CY}║   ${RD}✗${R}${WH} WS %s • ${RD}DOWN${WH}                        ║${R}\n" "$WS_PORT"
-    WS_OK=0
+    printf "${GREEN}║${RESET} MockWallet         : ${WHITE}DISABLED${RESET}                  ${GREEN}║${RESET}\n"
 fi
 
-VERIFY_CODE="$(
-    curl \
-        -sS \
-        -o /dev/null \
-        -w '%{http_code}' \
-        --connect-timeout 1 \
-        --max-time 2 \
-        "http://${HOST}:${VERIFY_PORT}/verify/ping" \
-        2>/dev/null
-)"
+printf "${GREEN}║${RESET} Provider PID       : ${WHITE}%-29s${RESET}${GREEN}║${RESET}\n" "$PROVIDER_PID"
+printf "${GREEN}╚══════════════════════════════════════════════════════╝${RESET}\n"
 
-if [ "$VERIFY_CODE" = "200" ]; then
-    printf "${CY}║   ${GN}✓${R}${WH} Vérif. %s • ${GN}RÉPOND${WH} (${GN}%s${WH})${CY}            ║${R}\n" "$VERIFY_PORT" "$VERIFY_CODE"
-    VERIFY_OK=1
-else
-    printf "${CY}║   ${RD}✗${R}${WH} Vérif. %s • ${RD}DOWN${WH}                     ║${R}\n" "$VERIFY_PORT"
-    VERIFY_OK=0
+printf "\n"
+info "Logs:"
+printf "  Provider : %s\n" "$PROVIDER_LOG"
+printf "  Build    : %s\n" "$BUILD_LOG"
+
+if [[ "$START_MOCKWALLET" == "1" ]]; then
+    printf "  Mock     : %s\n" "$MOCKWALLET_LOG"
 fi
 
-printf "${CY}╚══════════════════════════════════════════════╝${R}\n"
-
-# ============================================================
-# VERDICT FINAL
-# ============================================================
-
-if [ "$HC_OK" -eq 1 ] &&
-   [ "$APP_STATE" = "ok" ] &&
-   [ "$MONGO_STATE" = "connected" ] &&
-   [ "$WS_OK" -eq 1 ] &&
-   [ "$VERIFY_OK" -eq 1 ]; then
-
-    printf "\n${GN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${R}\n"
-    printf "${GN}┃ ${WH}MOTEUR EN LIGNE • PID ${GO}%-10s${GN} ┃${R}\n" "$PID"
-    printf "${GN}┃ ${WH}HTTP ${GN}OK${WH} • MONGO ${GN}OK${WH} • WS ${GN}OK${WH}          ${GN}┃${R}\n"
-    printf "${GN}┃ ${WH}VERIFY ${GN}OK${WH} • COMPILATION ${GN}OK${WH}          ${GN}┃${R}\n"
-    printf "${GN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${R}\n"
-
-    exit 0
-else
-
-    printf "\n${GO}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${R}\n"
-    printf "${GO}┃ ${WH}MOTEUR • VÉRIFICATION REQUISE        ${GO}┃${R}\n"
-    printf "${GO}┃ ${WH}Consulte logs/server.log              ${GO}┃${R}\n"
-    printf "${GO}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${R}\n"
-
-    exit 1
-fi
+printf "\n"
+info "Stop Studio: ./stop.sh"
+printf "\n"

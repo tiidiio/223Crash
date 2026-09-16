@@ -14,6 +14,12 @@ import (
 // Queue persiste les callbacks CREDIT/ROLLBACK dans Mongo et les rejoue en cas
 // d'échec, avec backoff exponentiel et dead-letter après 6 tentatives.
 // DEBIT n'y passe pas : il doit être synchrone et bloquant (voir Client.Debit).
+//
+// NOTE Tranche 3 (scope volontairement limité) : cette Queue n'est pas encore Ledger-aware.
+// process() ignore l'Outcome renvoyé par Send — le comportement de retry/dead-letter reste
+// identique à avant. Rendre la Queue Ledger-aware (classification Accepted/Rejected/Unknown →
+// Confirm/Fail/PENDING, y compris sur dead-letter) est le sujet dédié de la Tranche 3bis —
+// voir /areas/223gaming-provider-core pour le contrat exact attendu.
 type Queue struct {
 	col     *mongo.Collection
 	deadCol *mongo.Collection
@@ -109,7 +115,8 @@ func (q *Queue) process(ctx context.Context, cb Callback) {
 	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	_, err := q.client.Send(sendCtx, cb)
+	// Outcome ignoré pour l'instant — voir note de package ci-dessus (Tranche 3bis).
+	_, _, err := q.client.Send(sendCtx, cb)
 	if err == nil {
 		if _, delErr := q.col.DeleteOne(ctx, bson.M{"_id": cb.ID}); delErr != nil {
 			log.Printf("wallet queue: delete %s après succès: %v", cb.ID, delErr)

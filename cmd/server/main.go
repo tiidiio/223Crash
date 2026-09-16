@@ -15,6 +15,7 @@ import (
 
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/mongobridge"
+	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
 	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
 )
 
@@ -49,6 +50,13 @@ func main() {
 
 	publisher := mongobridge.NewPublisher(store)
 
+	// Provider Core : le Ledger réutilise la connexion Mongo déjà ouverte par mongobridge
+	// (store.DB) — pas de 3e connexion Mongo dédiée, conformément à internal/provider/ledger.New.
+	provLedger, err := ledger.New(ctx, store.DB)
+	if err != nil {
+		log.Fatalf("provider ledger: %v", err)
+	}
+
 	walletClient := wallet.NewClient(walletURL, walletSecret)
 	walletQueue, err := wallet.NewQueue(ctx, mongoURI, mongoDB, walletClient)
 	if err != nil {
@@ -61,7 +69,7 @@ func main() {
 		log.Fatalf("engine: %v", err)
 	}
 
-	gw := newGateway(eng, jwtSecret, walletClient, walletQueue)
+	gw := newGateway(eng, jwtSecret, walletClient, walletQueue, provLedger)
 
 	go func() {
 		if err := eng.Run(ctx); err != nil && ctx.Err() == nil {

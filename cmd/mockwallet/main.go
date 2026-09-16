@@ -14,9 +14,16 @@ import (
 	"sync"
 )
 
+// callback reste une struct locale, indépendante de wallet.Callback : le mock simule un
+// opérateur tiers, il ne doit dépendre d'aucun type interne au Provider Core. GameID et
+// TransactionID sont présents ici uniquement pour observer le flux de corrélation en local
+// (log) — le mock ne leur applique aucune logique conditionnelle, conformément à la contrainte
+// d'opacité du Provider Core.
 type callback struct {
 	ID             string `json:"id"`
 	Type           string `json:"type"`
+	GameID         string `json:"gameId"`
+	TransactionID  string `json:"transactionId"`
 	OperatorID     string `json:"operatorId"`
 	PlayerID       string `json:"playerId"`
 	RoundID        string `json:"roundId"`
@@ -33,8 +40,8 @@ const startingBalance = 100000 // 1000.00 en unité mineure (centimes)
 
 type store struct {
 	mu       sync.Mutex
-	balances map[string]int64          // "operatorId:playerId" -> solde
-	seen     map[string]int64          // idempotencyKey -> solde déjà appliqué (anti double-traitement)
+	balances map[string]int64 // "operatorId:playerId" -> solde
+	seen     map[string]int64 // idempotencyKey -> solde déjà appliqué (anti double-traitement)
 }
 
 func newStore() *store {
@@ -136,7 +143,7 @@ func main() {
 			return
 		}
 
-		log.Printf("mockwallet: %s %s player=%s amount=%d nouveau_solde=%d", cb.Type, cb.ID, cb.PlayerID, cb.Amount, newBal)
+		log.Printf("mockwallet: %s %s game=%s txn=%s player=%s amount=%d nouveau_solde=%d", cb.Type, cb.ID, cb.GameID, cb.TransactionID, cb.PlayerID, cb.Amount, newBal)
 		json.NewEncoder(w).Encode(response{Balance: newBal})
 	})
 

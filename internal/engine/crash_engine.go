@@ -471,6 +471,14 @@ func (e *CrashEngine) PlaceBet(userID string, panel game.BetPanel, amount int64,
 	return e.bets.PlaceBet(userID, panel, amount, cashoutTarget)
 }
 
+// GetPanelBet retourne la mise active d'un joueur sur un panel donné du round courant —
+// utilisé par la gateway pour réconcilier un retry idempotent dont le DEBIT est CONFIRMED mais
+// dont le PlaceBet initial a été exécuté par un autre appel concurrent (voir
+// game.ErrBetAlreadyExists dans cmd/server/gateway.go.placeBetOrReuse).
+func (e *CrashEngine) GetPanelBet(userID string, panel game.BetPanel) (game.Bet, error) {
+	return e.bets.GetPanelBet(userID, panel)
+}
+
 // Cashout encaisse une mise au multiplicateur courant du moteur (jamais celui fourni par le client).
 func (e *CrashEngine) Cashout(betID string) (*game.Bet, error) {
 	now := time.Now()

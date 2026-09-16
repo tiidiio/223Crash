@@ -19,6 +19,15 @@ export class CrashSocket extends EventTarget {
     // 'actionTimeout' pour que l'UI débloque le bouton au lieu de rester figée.
     this.actionTimeoutMs = actionTimeoutMs;
     this._pendingBySlot = new Map(); // slot -> timeoutId
+
+    // betId actif par slot : conservé tant qu'aucune réponse DÉFINITIVE (BET_ACCEPTED/REJECTED)
+    // n'est reçue pour ce slot, y compris après un actionTimeout (qui réactive le bouton côté UI
+    // pendant que la requête d'origine est peut-être encore en cours de traitement serveur) et à
+    // travers une reconnexion (cette Map vit sur l'instance CrashSocket, pas sur la connexion WS
+    // sous-jacente). Réutiliser le même betId sur un retry est ce qui permet au serveur de
+    // garantir qu'une même tentative logique de pari ne produit jamais deux opérations
+    // financières — voir cmd/server/gateway.go.handleBet.
+    this._betIdBySlot = new Map();
   }
 
   connect() {
@@ -108,6 +117,18 @@ export class CrashSocket extends EventTarget {
     this._pendingBySlot.clear();
   }
 
+  // Génère un identifiant de pari opaque et suffisamment unique pour servir de clé
+  // d'idempotence côté serveur. crypto.randomUUID() est utilisé quand disponible (contexte
+  // sécurisé — https/wss ou localhost) ; le repli n'est pas cryptographique, seule l'unicité
+  // pratique est requise ici (la protection contre le rejeu est assurée côté serveur par
+  // l'index unique MongoDB, pas par une propriété cryptographique du betId lui-même).
+  _genBetId() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    return 'bet-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+  }
+
   _route(msg) {
     switch (msg.type) {
       case 'CONNECTED':
@@ -126,6 +147,14 @@ export class CrashSocket extends EventTarget {
         break;
       case 'BET_ACCEPTED':
       case 'BET_REJECTED':
+        // Réponse définitive pour ce betId : on libère le slot pour qu'un PROCHAIN pari (pas un
+        // retry de celui-ci) obtienne un nouveau betId.
+        if (msg.data?.slot !== undefined) {
+          this._clearActionTimeout(msg.data.slot);
+          this._betIdBySlot.delete(msg.data.slot);
+        }
+        this._emit('playerEvent', msg);
+        break;
       case 'CASHOUT_ACCEPTED':
       case 'CASHOUT_REJECTED':
         if (msg.data?.slot !== undefined) this._clearActionTimeout(msg.data.slot);
@@ -153,7 +182,16 @@ export class CrashSocket extends EventTarget {
   join() { this._send({ action: 'join' }); }
 
   bet(slot, amount, autoCashout = null) {
-    const ok = this._send({ action: 'bet', slot, amount, autoCashout });
+    // Réutilise le betId déjà en vol pour ce slot s'il y en a un (retry après actionTimeout,
+    // double-clic ayant échappé au garde-fou UI, etc.) — sinon en génère un nouveau. C'est cette
+    // réutilisation, combinée à l'idempotency côté serveur, qui garantit qu'une même tentative
+    // logique de pari ne produit jamais deux débits même en cas de retry.
+    let betId = this._betIdBySlot.get(slot);
+    if (!betId) {
+      betId = this._genBetId();
+      this._betIdBySlot.set(slot, betId);
+    }
+    const ok = this._send({ action: 'bet', betId, slot, amount, autoCashout });
     if (ok) this._armActionTimeout(slot);
     return ok;
   }
