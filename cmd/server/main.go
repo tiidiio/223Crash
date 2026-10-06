@@ -58,7 +58,7 @@ func main() {
 	}
 
 	walletClient := wallet.NewClient(walletURL, walletSecret)
-	walletQueue, err := wallet.NewQueue(ctx, mongoURI, mongoDB, walletClient)
+	walletQueue, err := wallet.NewQueue(ctx, store.DB, walletClient, provLedger)
 	if err != nil {
 		log.Fatalf("wallet queue: %v", err)
 	}
