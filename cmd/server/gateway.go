@@ -64,7 +64,7 @@ type wsClaims struct {
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true }, // embed cross-origin (opérateurs tiers)
+	CheckOrigin:     wsCheckOrigin,
 }
 
 type client struct {
@@ -72,6 +72,9 @@ type client struct {
 	operatorID string
 	conn       *websocket.Conn
 	send       chan []byte
+	done       chan struct{}
+	closeOnce  sync.Once
+	lim        *wsRateLimiter
 
 	mu         sync.Mutex
 	activeBets map[game.BetPanel]*game.Bet
@@ -82,16 +85,43 @@ func (c *client) sendJSON(v any) {
 	if err != nil {
 		return
 	}
+	c.trySend(b)
+}
+
+// trySend ne bloque jamais et ne panique jamais : c.send n'est jamais fermé.
+func (c *client) trySend(b []byte) {
+	select {
+	case <-c.done:
+		return
+	default:
+	}
 	select {
 	case c.send <- b:
+	case <-c.done:
 	default:
 		// buffer plein : client trop lent, on droppe plutôt que de bloquer le hub
 	}
 }
 
+// writePump est l'unique écrivain de la connexion (gorilla n'autorise qu'un écrivain concurrent).
 func (c *client) writePump() {
-	for b := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, b); err != nil {
+	ping := time.NewTicker(wsPingInterval)
+	defer ping.Stop()
+	for {
+		select {
+		case b := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if err := c.conn.WriteMessage(websocket.TextMessage, b); err != nil {
+				c.conn.Close()
+				return
+			}
+		case <-ping.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				c.conn.Close()
+				return
+			}
+		case <-c.done:
 			return
 		}
 	}
@@ -134,7 +164,7 @@ func (gw *gateway) unregister(c *client) {
 		delete(gw.clients, c.playerID)
 	}
 	gw.mu.Unlock()
-	close(c.send)
+	c.closeOnce.Do(func() { close(c.done) })
 }
 
 func (gw *gateway) broadcast(msgType string, data map[string]any) {
@@ -146,10 +176,7 @@ func (gw *gateway) broadcast(msgType string, data map[string]any) {
 	gw.mu.RLock()
 	defer gw.mu.RUnlock()
 	for _, c := range gw.clients {
-		select {
-		case c.send <- b:
-		default:
-		}
+		c.trySend(b)
 	}
 }
 
@@ -170,7 +197,7 @@ func (gw *gateway) settleCashout(c *client, bet *game.Bet) {
 			OperatorID:     ledger.OperatorID(c.operatorID),
 			PlayerID:       ledger.PlayerID(c.playerID),
 			ExternalRef:    ledger.ExternalRef(bet.ID),
-			IdempotencyKey: ledger.IdempotencyKey(fmt.Sprintf("credit:%s", bet.ID)),
+			IdempotencyKey: ledger.IdempotencyKey(fmt.Sprintf("credit:%s:%s:%s", c.operatorID, c.playerID, bet.ID)),
 			Type:           ledger.EntryCredit,
 			AmountMinor:    bet.Payout,
 		})
@@ -179,7 +206,7 @@ func (gw *gateway) settleCashout(c *client, bet *game.Bet) {
 		}
 
 		cb := wallet.Callback{
-			ID:             fmt.Sprintf("credit-%s", bet.ID),
+			ID:             fmt.Sprintf("credit-%s-%s-%s", c.operatorID, c.playerID, bet.ID),
 			Type:           wallet.CallbackCredit,
 			GameID:         productGameID,
 			OperatorID:     c.operatorID,
@@ -187,7 +214,7 @@ func (gw *gateway) settleCashout(c *client, bet *game.Bet) {
 			RoundID:        bet.RoundID,
 			BetID:          bet.ID,
 			Amount:         bet.Payout,
-			IdempotencyKey: fmt.Sprintf("credit:%s", bet.ID),
+			IdempotencyKey: fmt.Sprintf("credit:%s:%s:%s", c.operatorID, c.playerID, bet.ID),
 		}
 		if entry != nil {
 			cb.TransactionID = entry.TransactionID
@@ -257,24 +284,20 @@ func (gw *gateway) notifyLostBets(lost []game.Bet) {
 }
 
 func (gw *gateway) handleUpgrade(w http.ResponseWriter, r *http.Request) {
-	tokenStr := r.URL.Query().Get("token")
-	if tokenStr == "" {
-		http.Error(w, "token manquant", http.StatusUnauthorized)
+	claims, err := wsSecurity().validateToken(r.URL.Query().Get("token"), gw.jwtSecret)
+	if err != nil {
+		http.Error(w, "token invalide", http.StatusUnauthorized)
 		return
 	}
-
-	claims := &wsClaims{}
-	tok, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
-		return gw.jwtSecret, nil
-	}, jwt.WithValidMethods([]string{"HS512"}))
-	if err != nil || !tok.Valid || claims.Subject == "" {
-		http.Error(w, "token invalide", http.StatusUnauthorized)
+	if !wsSecurity().acquire() {
+		http.Error(w, "service saturé", http.StatusServiceUnavailable)
 		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade: %v", err)
+		wsSecurity().release()
 		return
 	}
 
@@ -283,6 +306,8 @@ func (gw *gateway) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		operatorID: claims.OperatorID,
 		conn:       conn,
 		send:       make(chan []byte, 32),
+		done:       make(chan struct{}),
+		lim:        newWSRateLimiter(wsMsgRate, wsMsgBurst),
 		activeBets: make(map[game.BetPanel]*game.Bet),
 	}
 
@@ -315,7 +340,9 @@ func (gw *gateway) readPump(c *client) {
 	defer func() {
 		gw.unregister(c)
 		c.conn.Close()
+		wsSecurity().release()
 	}()
+	wsConfigureConn(c.conn)
 
 	for {
 		_, raw, err := c.conn.ReadMessage()
@@ -323,6 +350,12 @@ func (gw *gateway) readPump(c *client) {
 			return
 		}
 
+		if !c.lim.allow() {
+			if c.lim.viol > wsMaxViolations {
+				return
+			}
+			continue
+		}
 		var msg clientMessage
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			continue
@@ -386,6 +419,10 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "montant invalide"}})
 		return
 	}
+	if msg.Amount > wsSecurity().maxBetUnits {
+		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "montant invalide"}})
+		return
+	}
 	amount := int64(msg.Amount) * centimesPerUnit
 	if amount <= 0 {
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "montant invalide"}})
@@ -400,7 +437,12 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 
 	cashoutTarget := noAutoCashoutSentinel
 	if msg.AutoCashout != nil {
-		cashoutTarget = *msg.AutoCashout
+		t := *msg.AutoCashout
+		if math.IsNaN(t) || math.IsInf(t, 0) || t < wsMinAutoCashout || t > wsMaxAutoCashout {
+			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "autoCashout invalide"}})
+			return
+		}
+		cashoutTarget = t
 	}
 
 	opCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)

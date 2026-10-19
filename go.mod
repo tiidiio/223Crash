@@ -3,7 +3,7 @@ module github.com/tiidiio/223Gaming/223Crash
 go 1.26.4
 
 require (
-	github.com/golang-jwt/jwt/v5 v5.2.1
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gorilla/websocket v1.5.3
 	go.mongodb.org/mongo-driver/v2 v2.9.0
 )

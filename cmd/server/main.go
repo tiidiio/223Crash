@@ -33,6 +33,8 @@ func main() {
 	mongoURI := requireEnv("MONGO_URI")
 	mongoDB := envOr("MONGO_DB", "223crash")
 	jwtSecret := requireEnv("JWT_SECRET")
+	wsCheckSecretStrength(jwtSecret)
+	_ = wsSecurity()
 	httpPort := envOr("HTTP_PORT", "8080")
 	wsPort := envOr("WS_PORT", "3000")
 	verifyPort := envOr("VERIFY_PORT", "8090")
@@ -131,7 +133,15 @@ func envOr(key, def string) string {
 }
 
 func serve(ctx context.Context, port string, mux http.Handler, name string) {
-	srv := &http.Server{Addr: ":" + port, Handler: mux}
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
