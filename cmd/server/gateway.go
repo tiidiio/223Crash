@@ -196,7 +196,7 @@ func (gw *gateway) settleCashout(c *client, bet *game.Bet) {
 			GameID:         productGameID,
 			OperatorID:     ledger.OperatorID(c.operatorID),
 			PlayerID:       ledger.PlayerID(c.playerID),
-			ExternalRef:    ledger.ExternalRef(bet.ID),
+			ExternalRef:    ledger.ExternalRef(fmt.Sprintf("round=%s|bet=%s", bet.RoundID, bet.ID)),
 			IdempotencyKey: ledger.IdempotencyKey(fmt.Sprintf("credit:%s:%s:%s", c.operatorID, c.playerID, bet.ID)),
 			Type:           ledger.EntryCredit,
 			AmountMinor:    bet.Payout,
@@ -312,6 +312,7 @@ func (gw *gateway) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 
 	gw.register(c)
+	gw.rehydrateBets(c)
 	go c.writePump()
 	go gw.readPump(c)
 
@@ -489,6 +490,14 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "débit refusé"}})
 			return
 		case ledger.StatusConfirmed:
+			if refunded, chkErr := gw.debitMarkedForRefund(c, resolved); chkErr != nil || refunded {
+				reason := "débit annulé"
+				if chkErr != nil {
+					reason = "service indisponible, réessayez"
+				}
+				c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": reason}})
+				return
+			}
 			gw.placeBetOrReuse(c, msg, panel, amount, cashoutTarget, round, resolved)
 			return
 		default:
@@ -529,6 +538,7 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 		// cette entrée reste PENDING (voir la branche !created ci-dessus), il attendra sa
 		// résolution ou s'arrêtera proprement sur timeout.
 		log.Printf("wallet: debit outcome indéterminé txn=%s betId=%s: %v", debitEntry.TransactionID, msg.BetID, err)
+		gw.markDebitForRefund(c, debitEntry, amount)
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "débit indéterminé, réessayez"}})
 	}
 }

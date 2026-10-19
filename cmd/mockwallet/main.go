@@ -116,7 +116,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/wallet/callback", func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<16))
 		if err != nil {
 			http.Error(w, "body illisible", http.StatusBadRequest)
 			return
@@ -148,5 +148,9 @@ func main() {
 	})
 
 	log.Printf("mockwallet: écoute sur :%s (solde initial %d/joueur)", port, startingBalance)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	bind := os.Getenv("MOCKWALLET_BIND")
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	log.Fatal(http.ListenAndServe(bind+":"+port, mux))
 }

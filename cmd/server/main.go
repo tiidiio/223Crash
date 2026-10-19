@@ -16,6 +16,7 @@ import (
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/mongobridge"
 	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
+	"github.com/tiidiio/223Gaming/223Crash/internal/provider/recovery"
 	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
 )
 
@@ -59,12 +60,14 @@ func main() {
 		log.Fatalf("provider ledger: %v", err)
 	}
 
+	checkWalletURL(walletURL)
 	walletClient := wallet.NewClient(walletURL, walletSecret)
 	walletQueue, err := wallet.NewQueue(ctx, store.DB, walletClient, provLedger)
 	if err != nil {
 		log.Fatalf("wallet queue: %v", err)
 	}
 	go walletQueue.Run(ctx)
+	go recovery.New(provLedger, walletClient).Run(ctx)
 
 	eng, err := engine.NewCrashEngine(engine.DefaultConfig())
 	if err != nil {

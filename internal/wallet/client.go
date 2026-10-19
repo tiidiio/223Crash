@@ -84,7 +84,7 @@ func (c *Client) Send(ctx context.Context, cb Callback) (int64, Outcome, error) 
 	}
 	defer resp.Body.Close()
 
-	raw, readErr := io.ReadAll(resp.Body)
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	switch {
 	case resp.StatusCode == http.StatusOK:
@@ -120,7 +120,7 @@ func (c *Client) Send(ctx context.Context, cb Callback) (int64, Outcome, error) 
 // correspondante, ouverte par l'appelant via ledger.Begin() avant cet appel.
 func (c *Client) Debit(ctx context.Context, gameID provider.GameID, txnID provider.TransactionID, operatorID, playerID, roundID, betID string, amount int64) (int64, Outcome, error) {
 	return c.Send(ctx, Callback{
-		ID:             fmt.Sprintf("debit-%s", betID),
+		ID:             fmt.Sprintf("debit-%s-%s-%s", operatorID, playerID, betID),
 		Type:           CallbackDebit,
 		GameID:         gameID,
 		TransactionID:  txnID,
@@ -129,7 +129,7 @@ func (c *Client) Debit(ctx context.Context, gameID provider.GameID, txnID provid
 		RoundID:        roundID,
 		BetID:          betID,
 		Amount:         amount,
-		IdempotencyKey: fmt.Sprintf("debit:%s", betID),
+		IdempotencyKey: fmt.Sprintf("debit:%s:%s:%s", operatorID, playerID, betID),
 		CreatedAt:      time.Now(),
 	})
 }
