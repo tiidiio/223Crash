@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/tiidiio/223Gaming/223Crash/internal/provider"
@@ -34,6 +36,26 @@ const (
 	// réponse ne soit perdue. Ne JAMAIS traiter comme un rejet.
 	OutcomeUnknown
 )
+
+// ErrBalanceUnavailable est enveloppée dans l'erreur retournée par Send lorsque l'opérateur a
+// confirmé l'opération (HTTP 200, OutcomeAccepted) mais que le solde de la réponse n'a pas pu
+// être lu ou décodé. L'opération EST appliquée ; seul le solde est inconnu. Dans ce cas la
+// valeur int64 retournée par Send (0) n'est PAS un solde : elle ne doit jamais être enregistrée.
+// Utiliser BalanceOrNil pour obtenir le solde à transmettre à ledger.Confirm.
+var ErrBalanceUnavailable = errors.New("wallet: solde indisponible dans la réponse de l'opérateur")
+
+// BalanceOrNil convertit le couple (balance, err) retourné par Send en solde optionnel pour
+// ledger.Confirm : nil quand le solde est indisponible (jamais un faux 0), &balance sinon.
+func BalanceOrNil(balance int64, err error) *int64 {
+	if errors.Is(err, ErrBalanceUnavailable) {
+		return nil
+	}
+	return &balance
+}
+
+// jsonMarshal est le point d'injection de l'encodage du corps (tests uniquement : json.Marshal
+// d'un Callback ne peut pas échouer avec les types actuels).
+var jsonMarshal = json.Marshal
 
 // Client parle au endpoint wallet d'un opérateur : signature HMAC-SHA256 du body,
 // idempotency key pour permettre les retries sans double-débit/double-crédit côté opérateur.
@@ -61,8 +83,12 @@ func (c *Client) sign(body []byte) string {
 // commentaire sur le type Outcome pour la sémantique exacte de chaque valeur. Utilisé
 // directement pour DEBIT (synchrone, doit réussir avant d'accepter un pari) et par la Queue
 // pour CREDIT/ROLLBACK (avec retry en cas de résultat indéterminé — voir Tranche 3bis).
+//
+// Contrat du solde retourné : il n'est valide que si l'erreur ne contient pas
+// ErrBalanceUnavailable. Un OutcomeAccepted avec une erreur non-nil signifie "opération
+// appliquée, solde inconnu" — jamais "solde = 0".
 func (c *Client) Send(ctx context.Context, cb Callback) (int64, Outcome, error) {
-	body, err := json.Marshal(cb)
+	body, err := jsonMarshal(cb)
 	if err != nil {
 		return 0, OutcomeRejected, fmt.Errorf("wallet: marshal callback: %w", err)
 	}
@@ -89,13 +115,14 @@ func (c *Client) Send(ctx context.Context, cb Callback) (int64, Outcome, error) 
 	switch {
 	case resp.StatusCode == http.StatusOK:
 		// L'opérateur a explicitement confirmé le traitement — c'est acquis quoi qu'il arrive
-		// ensuite à la lecture ou au parsing du corps (seul le solde retourné serait perdu).
+		// ensuite à la lecture ou au parsing du corps. Seul le solde est alors perdu : on le
+		// signale par ErrBalanceUnavailable pour que l'appelant ne l'enregistre pas comme 0.
 		if readErr != nil {
-			return 0, OutcomeAccepted, fmt.Errorf("wallet: %s accepté (HTTP 200) mais corps illisible: %w", cb.Type, readErr)
+			return 0, OutcomeAccepted, fmt.Errorf("wallet: %s accepté (HTTP 200) mais corps illisible: %w: %w", cb.Type, ErrBalanceUnavailable, readErr)
 		}
 		var out CallbackResponse
 		if err := json.Unmarshal(raw, &out); err != nil {
-			return 0, OutcomeAccepted, fmt.Errorf("wallet: %s accepté (HTTP 200) mais réponse invalide: %w", cb.Type, err)
+			return 0, OutcomeAccepted, fmt.Errorf("wallet: %s accepté (HTTP 200) mais réponse invalide: %w: %w", cb.Type, ErrBalanceUnavailable, err)
 		}
 		return out.Balance, OutcomeAccepted, nil
 
@@ -135,11 +162,17 @@ func (c *Client) Debit(ctx context.Context, gameID provider.GameID, txnID provid
 }
 
 // GetBalance interroge le solde courant (utilisé sur JOIN, remplace le placeholder 0).
+// Les identifiants sont encodés dans la query string : un operatorID ou playerID contenant
+// '&', '=', '#' ou des espaces ne peut ni injecter de paramètre ni tronquer la requête.
 func (c *Client) GetBalance(ctx context.Context, operatorID, playerID string) (int64, error) {
-	url := fmt.Sprintf("%s/wallet/balance?operatorId=%s&playerId=%s", c.baseURL, operatorID, playerID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	q := url.Values{}
+	q.Set("operatorId", operatorID)
+	q.Set("playerId", playerID)
+	target := c.baseURL + "/wallet/balance?" + q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("wallet: get balance: build request: %w", err)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -151,7 +184,7 @@ func (c *Client) GetBalance(ctx context.Context, operatorID, playerID string) (i
 	}
 	var out CallbackResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("wallet: get balance: décodage: %w", err)
 	}
 	return out.Balance, nil
 }

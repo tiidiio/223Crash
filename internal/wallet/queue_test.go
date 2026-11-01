@@ -343,7 +343,7 @@ func TestProcess_NoTransactionID_DoesNotPanicAndProcesses(t *testing.T) {
 // Documente le comportement ACTUEL (trou de cohérence) : Confirm échoue (ici ErrEntryNotFound),
 // mais le callback est quand même supprimé de la queue. Après correctif de queue.go
 // (ne supprimer que si Confirm réussit, sinon dead-letter), inverser ces assertions.
-func TestProcess_AcceptedButConfirmFails_CurrentBehaviorDropsCallback(t *testing.T) {
+func TestProcess_AcceptedButConfirmFails_DeadLettersWithTrace(t *testing.T) {
 	e := newTestEnv(t, respond(200, `{"balance":10}`))
 	cb := e.seed(t, "orphan", false)
 	cb.TransactionID = "txn_inexistant"
@@ -351,12 +351,11 @@ func TestProcess_AcceptedButConfirmFails_CurrentBehaviorDropsCallback(t *testing
 	e.q.process(context.Background(), cb)
 
 	if n := e.queueCount(t); n != 0 {
-		t.Fatalf("queue = %d (comportement actuel attendu : 0)", n)
+		t.Fatalf("queue = %d (attendu : 0, callback retiré de la file)", n)
 	}
-	if n := e.deadCount(t); n != 0 {
-		t.Fatalf("dead = %d (comportement actuel attendu : 0, trace perdue)", n)
+	if n := e.deadCount(t); n != 1 {
+		t.Fatalf("dead = %d (attendu : 1, trace durable pour réconciliation manuelle)", n)
 	}
-	t.Log("CONNU: argent déplacé côté opérateur, callback supprimé, aucune entrée Ledger résolue")
 }
 
 func TestDrainDue_ProcessesOnceThenBacksOff(t *testing.T) {
