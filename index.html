@@ -46,6 +46,30 @@
 </div>
 
 <script type="module">
+  import { HeliSound } from './heli-sound.js';
+  const heli = new HeliSound();
+  try { heli.setMuted(localStorage.getItem('heliMuted') === '1'); } catch (_) {}
+  const heliGestures = ['pointerdown', 'keydown', 'touchend'];
+  const unlockHeli = () => {
+    heli.unlock().then(() => {
+      heliGestures.forEach((ev) => window.removeEventListener(ev, unlockHeli, true));
+    }).catch(() => {});
+  };
+  heliGestures.forEach((ev) => window.addEventListener(ev, unlockHeli, true));
+  const heliBtn = document.createElement('button');
+  heliBtn.type = 'button';
+  heliBtn.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:50;padding:4px 10px;font-size:16px;line-height:1;background:rgba(20,23,29,.85);color:#D4A54A;border:1px solid #D4A54A;border-radius:6px;cursor:pointer';
+  const paintHeliBtn = () => {
+    heliBtn.textContent = heli.muted ? '🔇' : '🔊';
+    heliBtn.setAttribute('aria-label', heli.muted ? 'Activer le son' : 'Couper le son');
+  };
+  heliBtn.addEventListener('click', () => {
+    heli.setMuted(!heli.muted);
+    try { localStorage.setItem('heliMuted', heli.muted ? '1' : '0'); } catch (_) {}
+    paintHeliBtn();
+  });
+  paintHeliBtn();
+  document.body.appendChild(heliBtn);
 import { CrashSocket } from './ws.js';
 
 const params = new URLSearchParams(location.search);
@@ -761,6 +785,7 @@ if (!token) {
     const { type, data } = e.detail;
     if (type === 'ROUND_START') {
       roundIdEl.textContent = data.roundId ?? '';
+      heli.stop();
       roundStateEl.textContent = 'mises ouvertes';
       multEl.textContent = '1.00x';
       multEl.classList.remove('crashed');
@@ -776,12 +801,15 @@ if (!token) {
       mode = 'flying';
       roundStateEl.textContent = 'en vol';
       multEl.textContent = Number(data.multiplier).toFixed(2) + 'x';
+      heli.start();
+      heli.setMultiplier(Number(data.multiplier));
     } else if (type === 'CRASH') {
       roundStateEl.textContent = 'crashé';
       multEl.textContent = Number(data.crashPoint).toFixed(2) + 'x';
       multEl.classList.add('crashed');
       zoneEl.classList.add('crashed');
       pushHistory(data.crashPoint);
+      heli.crash();
       // L'hélico explose exactement au crashPoint (inverse de la formule engine).
       const cp = Number(data.crashPoint);
       crashElapsed = Number.isFinite(cp) ? (cp > 1 ? Math.log(cp) / 0.00006 : 0) : lastE;

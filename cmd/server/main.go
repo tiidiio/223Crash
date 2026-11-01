@@ -158,10 +158,11 @@ func serve(ctx context.Context, port string, mux http.Handler, name string) {
 }
 
 var allowedStaticFiles = map[string]string{
-	"/":           "index.html",
-	"/index.html": "index.html",
-	"/style.css":  "style.css",
-	"/ws.js":      "ws.js",
+	"/":              "index.html",
+	"/index.html":    "index.html",
+	"/style.css":     "style.css",
+	"/ws.js":         "ws.js",
+	"/heli-sound.js": "heli-sound.js",
 }
 
 func serveStatic(w http.ResponseWriter, r *http.Request) {
