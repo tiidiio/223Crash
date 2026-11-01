@@ -74,51 +74,629 @@ if (!token) {
   const canvas = document.getElementById('game-canvas');
   const ctx = canvas.getContext('2d');
 
+  /* =====================================================================
+     SCÈNE — hélicoptère militaire (canvas pur, zéro asset)
+     Source de vérité = elapsedMs serveur (resync à chaque TICK).
+     ===================================================================== */
+
+  const DPR = Math.min(window.devicePixelRatio || 1, 2);
+  const TILE = 960;
+  const TWO_PI = Math.PI * 2;
+  let W = 0, H = 0, S = 1, GY = 0;
+
   function resizeCanvas() {
-    canvas.width = zoneEl.clientWidth;
-    canvas.height = zoneEl.clientHeight;
+    W = zoneEl.clientWidth;
+    H = zoneEl.clientHeight;
+    if (!W || !H) return;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    S = Math.max(0.62, Math.min(1.15, W / 460));
+    GY = H - 38;
   }
   resizeCanvas();
-  window.addEventListener('resize', resizeCanvas);
+  if (window.ResizeObserver) new ResizeObserver(resizeCanvas).observe(zoneEl);
+  else window.addEventListener('resize', resizeCanvas);
 
   // formule engine confirmée : e^(0.00006 * elapsedMs)
   function multiplierAt(elapsedMs) {
     return Math.exp(0.00006 * elapsedMs);
   }
 
-  let roundStartTs = null;
-  let rafId = null;
+  // ---------- monde procédural (déterministe, tuilé) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
 
-  function drawCurve(elapsedMs) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const w = canvas.width, h = canvas.height;
-    ctx.beginPath();
-    ctx.strokeStyle = '#D4A54A';
-    ctx.lineWidth = 2;
-    const steps = 80;
-    let lastX = 0, lastY = h;
-    for (let i = 0; i <= steps; i++) {
-      const t = (elapsedMs * i) / steps;
-      const m = multiplierAt(t);
-      const x = (i / steps) * w * 0.9;
-      const y = h - Math.min((m - 1) * (h / 4), h * 0.85);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      lastX = x; lastY = y;
+  function makeSkyline(seed, wMin, wMax, hMin, hMax) {
+    const rnd = mulberry32(seed);
+    const arr = [];
+    let x = 0;
+    while (x < TILE) {
+      const w = wMin + rnd() * (wMax - wMin);
+      arr.push({ x, w, h: hMin + rnd() * (hMax - hMin), id: arr.length });
+      x += w + rnd() * 5;
     }
-    ctx.stroke();
+    const f = TILE / x;
+    arr.forEach((b) => { b.x *= f; b.w *= f; });
+    return arr;
+  }
+
+  const SKY_FAR = makeSkyline(101, 30, 70, 30, 90);
+  const SKY_MID = makeSkyline(202, 24, 56, 24, 70);
+  const rndW = mulberry32(2231);
+  const STARS = Array.from({ length: 70 }, () => ({ x: rndW() * TILE, y: rndW(), r: 0.7 + rndW() * 1.3, tw: rndW() * TWO_PI }));
+  const CLOUDS = Array.from({ length: 6 }, () => ({ x: rndW() * TILE, y: 0.12 + rndW() * 0.5, w: 80 + rndW() * 100, s: 0.7 + rndW() * 0.6 }));
+
+  function eachTile(scroll, cb) {
+    const off = -(((scroll % TILE) + TILE) % TILE);
+    for (let ox = off; ox < W; ox += TILE) cb(ox);
+  }
+
+  function dot(x, y, r) {
     ctx.beginPath();
-    ctx.fillStyle = '#4FB8AE';
-    ctx.arc(lastX, lastY, 5, 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, TWO_PI);
     ctx.fill();
   }
 
-  function loop() {
-    if (roundStartTs) {
-      drawCurve(performance.now() - roundStartTs);
-    }
-    rafId = requestAnimationFrame(loop);
+  // ---------- trajectoire : 100% fonction de elapsedMs ----------
+  // Marges calées sur l'envergure de l'hélico (queue ~96, rotor/nez ~78) pour ne jamais être coupé.
+  const x0 = () => Math.max(W * 0.2, 104 * S);
+  const xMax = () => Math.max(x0() + 20, W - 92 * S);
+  const y0 = () => GY - 32 * S;       // roues posées sur le pad
+  const yTop = () => H * 0.42;
+
+  function pos(e) {
+    const m = multiplierAt(e);
+    const r = 1 - 1 / (1 + (m - 1) * 0.6);
+    const p = 1 - Math.exp(-e / 9000);
+    return {
+      x: x0() + p * (xMax() - x0()),
+      y: y0() - r * (y0() - yTop()),
+      r,
+    };
   }
-  loop();
+
+  // ---------- décor ----------
+  function drawSky(r) {
+    const g = ctx.createLinearGradient(0, 0, 0, GY);
+    g.addColorStop(0, '#04060A');
+    g.addColorStop(0.6, '#0B121A');
+    g.addColorStop(1, '#17252E');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    const glow = ctx.createRadialGradient(W * 0.5, GY, 0, W * 0.5, GY, W * 0.7);
+    glow.addColorStop(0, `rgba(79,184,174,${0.16 * (1 - r * 0.7)})`);
+    glow.addColorStop(1, 'rgba(79,184,174,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawMoon(r) {
+    const mx = W * 0.82, my = H * 0.2 + r * 18;
+    ctx.fillStyle = 'rgba(221,230,234,0.08)';
+    dot(mx, my, 30 * S);
+    ctx.fillStyle = 'rgba(221,230,234,0.85)';
+    dot(mx, my, 12 * S);
+  }
+
+  function drawStars(scroll, r, now) {
+    ctx.fillStyle = '#E7E9EE';
+    const base = 0.45 + 0.55 * r;
+    eachTile(scroll, (ox) => {
+      for (const s of STARS) {
+        const sx = ox + s.x;
+        if (sx < 0 || sx > W) continue;
+        const tw = 0.5 + 0.5 * Math.sin(now / 700 + s.tw);
+        ctx.globalAlpha = base * (0.35 + 0.65 * tw);
+        ctx.fillRect(sx, s.y * (GY - 24), s.r, s.r);
+      }
+    });
+    ctx.globalAlpha = 1;
+  }
+
+  function drawClouds(scroll, r) {
+    ctx.fillStyle = 'rgba(143,182,194,0.07)';
+    eachTile(scroll, (ox) => {
+      for (const c of CLOUDS) {
+        const cx = ox + c.x;
+        const w = c.w * S;
+        if (cx < -w || cx > W + w) continue;
+        const cy = c.y * H * 0.7 + r * 28;
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, w * 0.5, 9 * S * c.s, 0, 0, TWO_PI);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.ellipse(cx + w * 0.22, cy - 6 * S, w * 0.3, 8 * S * c.s, 0, 0, TWO_PI);
+        ctx.fill();
+      }
+    });
+  }
+
+  function drawSkyline(layer, scroll, color, windows) {
+    ctx.fillStyle = color;
+    eachTile(scroll, (ox) => {
+      for (const b of layer) {
+        const bx = ox + b.x;
+        if (bx > W || bx + b.w < 0) continue;
+        const bh = b.h * S;
+        ctx.fillRect(bx, GY - bh, b.w + 1, bh);
+      }
+    });
+    if (!windows) return;
+    ctx.fillStyle = 'rgba(212,165,74,0.5)';
+    eachTile(scroll, (ox) => {
+      for (const b of layer) {
+        const bx = ox + b.x;
+        if (bx > W || bx + b.w < 0) continue;
+        const bh = b.h * S;
+        const cols = Math.max(1, Math.floor(b.w / 9));
+        const rows = Math.floor(bh / 12) - 1;
+        for (let rr = 0; rr < rows; rr++) {
+          for (let cc = 0; cc < cols; cc++) {
+            if (((b.id * 31 + rr * 17 + cc * 7) % 5) === 0) {
+              ctx.fillRect(bx + 4 + cc * 9, GY - bh + 6 + rr * 12, 3, 4);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  function drawGround(sN) {
+    ctx.fillStyle = '#0B1016';
+    ctx.fillRect(0, GY, W, H - GY);
+    ctx.fillStyle = 'rgba(212,165,74,0.35)';
+    ctx.fillRect(0, GY, W, 1);
+    const sp = 46 * S;
+    ctx.fillStyle = 'rgba(79,184,174,0.75)';
+    for (let x = -(sN % sp); x < W; x += sp) dot(x, GY + 7 * S, 1.6);
+  }
+
+  function drawPad(sN, now) {
+    const px = x0() + 22 * S - sN;
+    if (px < -90 * S) return;
+    const w = 62 * S, top = GY - 6 * S;
+    ctx.fillStyle = '#2A303B';
+    ctx.fillRect(px - w, top, w * 2, 6 * S);
+    ctx.fillStyle = '#D4A54A';
+    ctx.fillRect(px - w, top, w * 2, 1.6);
+    const blink = (Math.floor(now / 500) % 2) ? 1 : 0.35;
+    ctx.fillStyle = `rgba(79,184,174,${blink})`;
+    dot(px - w + 4, top + 3 * S, 1.8);
+    dot(px + w - 4, top + 3 * S, 1.8);
+  }
+
+  function drawDust(cx, now, k) {
+    ctx.fillStyle = `rgba(150,160,170,${0.16 * k})`;
+    for (let i = 0; i < 6; i++) {
+      const ph = (now / 520 + i * 0.31) % 1;
+      const dir = i % 2 ? 1 : -1;
+      ctx.beginPath();
+      ctx.ellipse(cx + dir * (20 + ph * 70) * S, GY - 3 * S, (12 + ph * 18) * S, (2.5 + ph * 3) * S, 0, 0, TWO_PI);
+      ctx.fill();
+    }
+  }
+
+  function drawTrail(e, stroke, fillTop) {
+    if (e <= 0) return;
+    const n = 56;
+    const first = pos(0);
+    let p = first;
+    ctx.beginPath();
+    ctx.moveTo(first.x, first.y);
+    for (let i = 1; i <= n; i++) {
+      p = pos((e * i) / n);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+    ctx.lineTo(p.x, GY);
+    ctx.lineTo(first.x, GY);
+    ctx.closePath();
+    const g = ctx.createLinearGradient(0, p.y, 0, GY);
+    g.addColorStop(0, fillTop);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.fill();
+  }
+
+  // ---------- hélicoptère militaire (vue de côté, nez vers la droite) ----------
+  function bodyPath() {
+    ctx.beginPath();
+    ctx.moveTo(66, 7);
+    ctx.quadraticCurveTo(67, -2, 52, -6);
+    ctx.lineTo(34, -12);
+    ctx.lineTo(20, -14);
+    ctx.lineTo(-10, -17);
+    ctx.lineTo(-40, -10);
+    ctx.lineTo(-92, -8);
+    ctx.lineTo(-92, -3);
+    ctx.lineTo(-40, 6);
+    ctx.lineTo(-10, 14);
+    ctx.lineTo(40, 14);
+    ctx.quadraticCurveTo(62, 14, 66, 7);
+    ctx.closePath();
+  }
+
+  function poly(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+  }
+
+  function patch(cx, cy, rx, ry, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, TWO_PI);
+    ctx.fill();
+  }
+
+  function drawHeli(x, y, angle, s, phase, now) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+    ctx.scale(s, s);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // train d'atterrissage fixe
+    ctx.strokeStyle = '#1B1E1A';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-6, 12); ctx.lineTo(-6, 24);
+    ctx.moveTo(50, 12); ctx.lineTo(52, 22);
+    ctx.stroke();
+    ctx.fillStyle = '#14171D';
+    dot(-6, 25, 4.2); dot(52, 23.5, 3.2);
+    ctx.fillStyle = '#8B92A0';
+    dot(-6, 25, 1.6); dot(52, 23.5, 1.2);
+
+    // pylône + pod de roquettes
+    ctx.strokeStyle = '#2A2D28';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(14, 11); ctx.lineTo(14, 16);
+    ctx.stroke();
+    ctx.fillStyle = '#3A3F36';
+    ctx.fillRect(4, 15, 34, 7);
+    ctx.fillStyle = '#12140F';
+    dot(37, 17.2, 1.3); dot(37, 20, 1.3);
+    ctx.fillStyle = '#6B7466';
+    ctx.fillRect(4, 15, 34, 1.4);
+
+    // canon sous le nez
+    ctx.strokeStyle = '#23261F';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(54, 11); ctx.lineTo(75, 13.5);
+    ctx.stroke();
+
+    // fuselage + camouflage
+    const bg = ctx.createLinearGradient(0, -18, 0, 14);
+    bg.addColorStop(0, '#6E7F45');
+    bg.addColorStop(1, '#46522B');
+    bodyPath();
+    ctx.fillStyle = bg;
+    ctx.fill();
+    ctx.save();
+    bodyPath();
+    ctx.clip();
+    patch(10, -6, 26, 6, 'rgba(45,56,26,0.85)');
+    patch(-52, -2, 28, 4, 'rgba(45,56,26,0.85)');
+    patch(52, 5, 14, 5, 'rgba(45,56,26,0.85)');
+    patch(-20, 3, 18, 5, 'rgba(150,130,78,0.75)');
+    patch(30, -11, 11, 4, 'rgba(150,130,78,0.7)');
+    patch(-72, -5, 12, 3, 'rgba(150,130,78,0.7)');
+    ctx.restore();
+    bodyPath();
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // nacelle moteur + échappement
+    ctx.fillStyle = '#3B4524';
+    ctx.beginPath();
+    ctx.ellipse(-12, -19, 20, 7, 0, 0, TWO_PI);
+    ctx.fill();
+    ctx.fillStyle = '#12140F';
+    ctx.beginPath();
+    ctx.ellipse(-30, -19, 3.5, 3, 0, 0, TWO_PI);
+    ctx.fill();
+
+    // verrières tandem (tireur devant, pilote surélevé derrière)
+    ctx.fillStyle = 'rgba(120,200,205,0.88)';
+    poly([[64, 5], [60, -3], [48, -8], [36, -11], [34, 0], [52, 3]]);
+    ctx.fill();
+    poly([[30, -12], [22, -19], [8, -19], [5, -4], [30, -2]]);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    poly([[58, 1], [54, -4], [44, -7], [40, -6], [46, 0]]);
+    ctx.fill();
+    poly([[24, -16], [12, -16], [10, -9], [22, -9]]);
+    ctx.fill();
+    ctx.strokeStyle = '#2A3320';
+    ctx.lineWidth = 1.5;
+    poly([[64, 5], [60, -3], [48, -8], [36, -11], [34, 0], [52, 3]]);
+    ctx.stroke();
+    poly([[30, -12], [22, -19], [8, -19], [5, -4], [30, -2]]);
+    ctx.stroke();
+
+    // cocarde tricolore (vert / jaune / rouge) + immatriculation
+    ctx.fillStyle = '#1FA34A'; dot(-30, -2, 8);
+    ctx.fillStyle = '#F2C230'; dot(-30, -2, 5.4);
+    ctx.fillStyle = '#D2342B'; dot(-30, -2, 2.8);
+    ctx.fillStyle = 'rgba(231,233,238,0.85)';
+    ctx.font = '700 7px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('223', -62, 0.5);
+
+    // stabilisateur + dérive aux couleurs nationales
+    ctx.fillStyle = '#3B4524';
+    ctx.fillRect(-94, -9, 16, 3);
+    ctx.fillStyle = '#4F5C30';
+    poly([[-80, -8], [-92, -32], [-79, -32], [-66, -8]]);
+    ctx.fill();
+    ctx.save();
+    poly([[-80, -8], [-92, -32], [-79, -32], [-66, -8]]);
+    ctx.clip();
+    ctx.fillStyle = '#1FA34A'; ctx.fillRect(-94, -34, 10, 30);
+    ctx.fillStyle = '#F2C230'; ctx.fillRect(-84, -34, 9, 30);
+    ctx.fillStyle = '#D2342B'; ctx.fillRect(-75, -34, 10, 30);
+    ctx.restore();
+
+    // feu anticollision clignotant
+    ctx.fillStyle = `rgba(255,70,60,${(Math.floor(now / 450) % 2) ? 1 : 0.25})`;
+    dot(-86, -33, 2.2);
+
+    // rotor anticouple
+    ctx.save();
+    ctx.translate(-91, -22);
+    ctx.fillStyle = 'rgba(231,233,238,0.12)';
+    dot(0, 0, 11);
+    const a = phase * 1.4;
+    ctx.strokeStyle = 'rgba(231,233,238,0.85)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * 11, Math.sin(a) * 11); ctx.lineTo(-Math.cos(a) * 11, -Math.sin(a) * 11);
+    ctx.moveTo(Math.cos(a + Math.PI / 2) * 11, Math.sin(a + Math.PI / 2) * 11);
+    ctx.lineTo(-Math.cos(a + Math.PI / 2) * 11, -Math.sin(a + Math.PI / 2) * 11);
+    ctx.stroke();
+    ctx.fillStyle = '#14171D';
+    dot(0, 0, 2.2);
+    ctx.restore();
+
+    // mât + rotor principal 5 pales
+    ctx.fillStyle = '#2A3320';
+    ctx.fillRect(3, -31, 6, 13);
+    const L = 78, hx = 6, hy = -31;
+    ctx.fillStyle = 'rgba(231,233,238,0.10)';
+    ctx.beginPath();
+    ctx.ellipse(hx, hy, L, 4.5, 0, 0, TWO_PI);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(205,210,218,0.92)';
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    for (let k = 0; k < 5; k++) {
+      const ang = phase + (k * TWO_PI) / 5;
+      ctx.moveTo(hx, hy);
+      ctx.lineTo(hx + Math.cos(ang) * L, hy + Math.sin(ang) * 3.2);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#14171D';
+    dot(hx, hy, 4.5);
+    ctx.fillStyle = '#6B7466';
+    dot(hx, hy, 1.8);
+
+    ctx.restore();
+  }
+
+  // ---------- explosion au crash ----------
+  let crashFx = null;
+
+  function startCrashFx(e) {
+    const p = pos(e);
+    const fx = { ts: performance.now(), x: p.x, y: p.y, tilt: smoothTilt, parts: [], debris: [], smoke: [], smokeAcc: 0 };
+    for (let i = 0; i < 42; i++) {
+      const a = Math.random() * TWO_PI;
+      const sp = (60 + Math.random() * 280) * S;
+      fx.parts.push({
+        x: p.x, y: p.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 50,
+        life: 0, max: 500 + Math.random() * 800, r: (2 + Math.random() * 4) * S, hue: Math.random(),
+      });
+    }
+    ['blade', 'blade', 'blade', 'tail', 'body', 'pod'].forEach((kind) => {
+      fx.debris.push({
+        kind, x: p.x, y: p.y,
+        vx: (Math.random() - 0.5) * 300 * S, vy: -(80 + Math.random() * 240) * S,
+        rot: Math.random() * TWO_PI, vr: (Math.random() - 0.5) * 16,
+      });
+    });
+    crashFx = fx;
+  }
+
+  function drawDebris(d, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(d.x, d.y);
+    ctx.rotate(d.rot);
+    ctx.scale(S, S);
+    if (d.kind === 'blade') {
+      ctx.fillStyle = '#CDD2DA';
+      ctx.fillRect(-30, -2, 60, 4);
+    } else if (d.kind === 'tail') {
+      ctx.fillStyle = '#4F5C30';
+      ctx.beginPath();
+      ctx.moveTo(-34, -4); ctx.lineTo(34, -6); ctx.lineTo(34, 0); ctx.lineTo(-34, 5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#1FA34A'; ctx.fillRect(-34, -16, 6, 11);
+      ctx.fillStyle = '#F2C230'; ctx.fillRect(-28, -16, 6, 11);
+      ctx.fillStyle = '#D2342B'; ctx.fillRect(-22, -16, 6, 11);
+    } else if (d.kind === 'body') {
+      ctx.fillStyle = '#5B6B3A';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 24, 12, 0, 0, TWO_PI);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(120,200,205,0.9)';
+      ctx.beginPath();
+      ctx.ellipse(10, -3, 9, 6, 0, 0, TWO_PI);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = '#3A3F36';
+      ctx.fillRect(-17, -3.5, 34, 7);
+    }
+    ctx.restore();
+  }
+
+  function renderCrash(now, dt) {
+    const f = crashFx;
+    if (!f) return;
+    const age = now - f.ts;
+
+    if (age < 70) drawHeli(f.x, f.y, f.tilt, S, rotorPhase, now);
+
+    if (age < 700) {
+      const k = age / 700;
+      const rad = (28 + 80 * Math.sqrt(k)) * S;
+      const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, rad);
+      g.addColorStop(0, `rgba(255,248,220,${1 - k})`);
+      g.addColorStop(0.35, `rgba(255,196,90,${0.9 * (1 - k)})`);
+      g.addColorStop(0.7, `rgba(229,98,46,${0.7 * (1 - k)})`);
+      g.addColorStop(1, 'rgba(229,98,46,0)');
+      ctx.fillStyle = g;
+      dot(f.x, f.y, rad);
+    }
+
+    if (age < 600) {
+      const k = age / 600;
+      ctx.strokeStyle = `rgba(255,214,140,${0.8 * (1 - k)})`;
+      ctx.lineWidth = 3 * (1 - k) + 0.5;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, (10 + 180 * k) * S, 0, TWO_PI);
+      ctx.stroke();
+    }
+
+    // fumée noire
+    if (age < 1800) {
+      f.smokeAcc += dt;
+      while (f.smokeAcc > 0.045) {
+        f.smokeAcc -= 0.045;
+        f.smoke.push({
+          x: f.x + (Math.random() - 0.5) * 34 * S, y: f.y + (Math.random() - 0.5) * 14 * S,
+          vx: (Math.random() - 0.5) * 24, vy: -(20 + Math.random() * 34),
+          life: 0, max: 1200 + Math.random() * 700, r: (8 + Math.random() * 9) * S,
+        });
+      }
+    }
+    f.smoke = f.smoke.filter((s) => s.life < s.max);
+    for (const s of f.smoke) {
+      s.life += dt * 1000;
+      s.x += s.vx * dt; s.y += s.vy * dt;
+      const k = Math.min(1, s.life / s.max);
+      ctx.fillStyle = `rgba(40,44,52,${0.42 * (1 - k)})`;
+      dot(s.x, s.y, s.r * (1 + k * 1.7));
+    }
+
+    // étincelles
+    f.parts = f.parts.filter((p) => p.life < p.max);
+    for (const p of f.parts) {
+      p.life += dt * 1000;
+      p.vy += 380 * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      const k = Math.min(1, p.life / p.max);
+      ctx.fillStyle = `hsla(${12 + p.hue * 40},100%,${52 + p.hue * 18}%,${1 - k})`;
+      dot(p.x, p.y, p.r * (1 - k * 0.5));
+    }
+
+    // débris
+    const fade = age > 2200 ? Math.max(0, 1 - (age - 2200) / 900) : 1;
+    if (fade > 0) {
+      for (const d of f.debris) {
+        d.vy += 560 * dt;
+        d.x += d.vx * dt; d.y += d.vy * dt;
+        d.rot += d.vr * dt;
+        if (d.y > GY - 3) {
+          d.y = GY - 3;
+          d.vy *= -0.25; d.vx *= 0.7; d.vr *= 0.6;
+          if (Math.abs(d.vy) < 20) d.vy = 0;
+        }
+        drawDebris(d, fade);
+      }
+    }
+  }
+
+  // ---------- boucle de rendu ----------
+  let mode = 'idle';              // 'idle' | 'flying' | 'crashed'
+  let roundStartTs = null;
+  let crashElapsed = 0;
+  let lastE = 0;
+  let rotorPhase = 0;
+  let smoothTilt = 0.08;
+  let lastFrame = performance.now();
+
+  function render(now, dt) {
+    if (!W || !H) return;
+    ctx.clearRect(0, 0, W, H);
+
+    let e = 0;
+    if (mode === 'flying' && roundStartTs) e = Math.max(0, now - roundStartTs);
+    else if (mode === 'crashed') e = crashElapsed;
+    lastE = e;
+
+    const p = pos(e);
+    const r = p.r;
+
+    drawSky(r);
+    drawMoon(r);
+    drawStars(e * 0.006, r, now);
+    drawClouds(e * 0.025, r);
+    drawSkyline(SKY_FAR, e * 0.02, '#0E151D', false);
+    drawSkyline(SKY_MID, e * 0.04, '#131C26', true);
+    drawGround(e * 0.09);
+    drawPad(e * 0.09, now);
+
+    if (mode === 'crashed') {
+      drawTrail(e, '#C2493D', 'rgba(194,73,61,0.22)');
+      renderCrash(now, dt);
+    } else {
+      if (e > 0) drawTrail(e, '#D4A54A', 'rgba(79,184,174,0.20)');
+      rotorPhase += dt * (mode === 'flying' ? 46 : 16);
+      let tiltT = 0.06, bob = 0, hx = p.x, hy = p.y;
+      if (mode === 'flying' && e > 0) {
+        const q = pos(Math.max(0, e - 200));
+        const path = Math.atan2(p.y - q.y, Math.max(p.x - q.x, 0.01));
+        tiltT = 0.1 + Math.max(-0.5, Math.min(0.5, path)) * 0.3;
+        bob = Math.sin(now / 380) * 2.2 * S * (0.25 + r);
+      } else {
+        hx += (Math.random() - 0.5) * 0.7;
+        hy += Math.sin(now / 45) * 0.5;
+      }
+      smoothTilt += (tiltT - smoothTilt) * Math.min(1, dt * 6);
+      const near = Math.max(0, 1 - (y0() - hy) / (70 * S));
+      if (near > 0.02) drawDust(hx + 22 * S, now, near);
+      drawHeli(hx, hy + bob, smoothTilt, S, rotorPhase, now);
+    }
+  }
+
+  function frame() {
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - lastFrame) / 1000);
+    lastFrame = now;
+    render(now, dt);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  /* ===================== UI / LOGIQUE (inchangée) ===================== */
 
   function pushHistory(crashPoint) {
     const el = document.createElement('div');
@@ -142,6 +720,11 @@ if (!token) {
     // pour empêcher un double clic d'envoyer deux fois le même ordre.
     panel.querySelector('.action-btn').disabled = pending;
     panel.dataset.pending = pending ? 'true' : 'false';
+  }
+
+  function setPanelActive(panel, active) {
+    panel.dataset.active = active ? 'true' : 'false';
+    panel.querySelector('.action-btn').textContent = active ? 'ENCAISSER' : 'MISER';
   }
 
   socket.addEventListener('status', (e) => {
@@ -183,10 +766,14 @@ if (!token) {
       multEl.classList.remove('crashed');
       zoneEl.classList.remove('crashed');
       roundStartTs = null;
+      mode = 'idle';
+      crashFx = null;
+      document.querySelectorAll('.bet-panel').forEach((pn) => setPanelActive(pn, false));
     } else if (type === 'TICK') {
-      // Resynchronisé à CHAQUE tick (pas juste au premier) pour que la courbe
+      // Resynchronisé à CHAQUE tick (pas juste au premier) pour que la scène
       // ne dérive jamais du multiplicateur serveur, qui reste la seule source de vérité.
       roundStartTs = performance.now() - (data.elapsedMs || 0);
+      mode = 'flying';
       roundStateEl.textContent = 'en vol';
       multEl.textContent = Number(data.multiplier).toFixed(2) + 'x';
     } else if (type === 'CRASH') {
@@ -195,6 +782,11 @@ if (!token) {
       multEl.classList.add('crashed');
       zoneEl.classList.add('crashed');
       pushHistory(data.crashPoint);
+      // L'hélico explose exactement au crashPoint (inverse de la formule engine).
+      const cp = Number(data.crashPoint);
+      crashElapsed = Number.isFinite(cp) ? (cp > 1 ? Math.log(cp) / 0.00006 : 0) : lastE;
+      startCrashFx(crashElapsed);
+      mode = 'crashed';
       roundStartTs = null;
     }
   });
@@ -204,9 +796,9 @@ if (!token) {
     const panel = document.querySelector(`.bet-panel[data-slot="${data.slot}"]`);
     if (!panel) return;
     setPanelPending(panel, false);
-    if (type === 'BET_ACCEPTED') panel.dataset.active = 'true';
-    if (type === 'BET_REJECTED') panel.dataset.active = 'false';
-    if (type === 'CASHOUT_ACCEPTED' || type === 'CASHOUT_REJECTED') panel.dataset.active = 'false';
+    if (type === 'BET_ACCEPTED') setPanelActive(panel, true);
+    if (type === 'BET_REJECTED') setPanelActive(panel, false);
+    if (type === 'CASHOUT_ACCEPTED' || type === 'CASHOUT_REJECTED') setPanelActive(panel, false);
   });
 
   document.querySelectorAll('.bet-panel').forEach((panel) => {
