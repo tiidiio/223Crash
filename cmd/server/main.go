@@ -164,9 +164,6 @@ var allowedStaticFiles = map[string]string{
 	"/ws.js":         "ws.js",
 	"/heli-sound.js": "heli-sound.js",
 	"/bets.js":       "bets.js",
-	"/jet.wav":       "jet.wav",
-	"/jet-ab.wav":    "jet-ab.wav",
-	"/boom.wav":      "boom.wav",
 }
 
 func serveStatic(w http.ResponseWriter, r *http.Request) {
