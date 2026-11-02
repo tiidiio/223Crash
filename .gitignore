@@ -2,11 +2,8 @@ bin/
 .env
 logs/
 .runtime/
-*.log
 .domain
 /server
-*.bak
+*.bak*
 *.v1
-PROMPT_CLAUDE.md
-test-output.log
-engine.log
+*.log
