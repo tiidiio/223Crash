@@ -152,6 +152,7 @@ func newGateway(eng *engine.CrashEngine, jwtSecret string, walletClient *wallet.
 func (gw *gateway) register(c *client) {
 	gw.mu.Lock()
 	if old, ok := gw.clients[c.playerID]; ok {
+		_ = old.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4001, "session_replaced"), time.Now().Add(time.Second))
 		old.conn.Close()
 	}
 	gw.clients[c.playerID] = c
@@ -227,6 +228,10 @@ func (gw *gateway) settleCashout(c *client, bet *game.Bet) {
 	c.mu.Lock()
 	delete(c.activeBets, bet.Panel)
 	c.mu.Unlock()
+
+	if bet.Payout > 0 {
+		gw.refreshBalance(c, 500*time.Millisecond, 2*time.Second, 5*time.Second)
+	}
 
 	c.sendJSON(map[string]any{"type": "CASHOUT_ACCEPTED", "data": map[string]any{
 		"slot":   panelToSlot(bet.Panel),
@@ -344,15 +349,18 @@ func (gw *gateway) readPump(c *client) {
 		wsSecurity().release()
 	}()
 	wsConfigureConn(c.conn)
+	log.Printf("ws: connecté player=%s", c.playerID)
 
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
+			log.Printf("ws: fin player=%s: %v", c.playerID, err)
 			return
 		}
 
 		if !c.lim.allow() {
 			if c.lim.viol > wsMaxViolations {
+				log.Printf("ws: fin player=%s: trop de messages (rate limit)", c.playerID)
 				return
 			}
 			continue
@@ -372,6 +380,8 @@ func (gw *gateway) readPump(c *client) {
 				continue
 			}
 			c.sendJSON(map[string]any{"type": "BALANCE", "balance": centimesToUnits(balance)})
+		case "ping":
+			c.sendJSON(map[string]any{"type": "PONG"})
 		case "bet":
 			gw.handleBet(c, msg)
 		case "cashout":
@@ -498,6 +508,7 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 				c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": reason}})
 				return
 			}
+			gw.refreshBalance(c, 0)
 			gw.placeBetOrReuse(c, msg, panel, amount, cashoutTarget, round, resolved)
 			return
 		default:
@@ -521,6 +532,7 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 			log.Printf("ledger: confirm debit txn=%s: %v", debitEntry.TransactionID, cErr)
 			confirmed = debitEntry // best effort : le DEBIT est accepté côté wallet quoi qu'il arrive au Ledger
 		}
+		c.sendJSON(map[string]any{"type": "BALANCE", "balance": centimesToUnits(balance)})
 		gw.placeBetOrReuse(c, msg, panel, amount, cashoutTarget, round, confirmed)
 	case wallet.OutcomeRejected:
 		reason := ""
@@ -650,6 +662,7 @@ func (gw *gateway) rollbackConfirmedDebit(c *client, msg clientMessage, amount i
 	if qErr := gw.walletQueue.Enqueue(context.Background(), rb); qErr != nil {
 		log.Printf("wallet: enqueue ROLLBACK txn=%s: %v", debitEntry.TransactionID, qErr)
 	}
+	gw.refreshBalance(c, 800*time.Millisecond, 3*time.Second)
 	c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": placeErr.Error()}})
 }
 

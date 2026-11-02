@@ -163,6 +163,10 @@ var allowedStaticFiles = map[string]string{
 	"/style.css":     "style.css",
 	"/ws.js":         "ws.js",
 	"/heli-sound.js": "heli-sound.js",
+	"/bets.js":       "bets.js",
+	"/jet.wav":       "jet.wav",
+	"/jet-ab.wav":    "jet-ab.wav",
+	"/boom.wav":      "boom.wav",
 }
 
 func serveStatic(w http.ResponseWriter, r *http.Request) {
@@ -176,6 +180,7 @@ func serveStatic(w http.ResponseWriter, r *http.Request) {
 
 func forwardEvents(ctx context.Context, eng *engine.CrashEngine, pub *mongobridge.Publisher, gw *gateway) {
 	var roundStartedAt time.Time
+	tickSem := make(chan struct{}, 1) // 1 publication de tick Mongo max en vol
 
 	for {
 		select {
@@ -205,8 +210,16 @@ func forwardEvents(ctx context.Context, eng *engine.CrashEngine, pub *mongobridg
 				if elapsedMs < 0 {
 					elapsedMs = 0
 				}
-				if err := pub.PublishTick(ctx, ev.RoundID, ev.Multiplier, elapsedMs); err != nil {
-					log.Printf("publish TICK: %v", err)
+				rid, mult, el := ev.RoundID, ev.Multiplier, elapsedMs
+				select {
+				case tickSem <- struct{}{}:
+					go func() {
+						defer func() { <-tickSem }()
+						if err := pub.PublishTick(ctx, rid, mult, el); err != nil {
+							log.Printf("publish TICK: %v", err)
+						}
+					}()
+				default: // publication précédente encore en cours : tick sauté côté Mongo
 				}
 				gw.broadcast("TICK", map[string]any{
 					"roundId":    ev.RoundID,
