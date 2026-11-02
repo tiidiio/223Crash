@@ -102,7 +102,8 @@ export class HeliSound {
   }
 
   crash() {
-    if (!this.ctx || !this.running) return;
+    if (!this.ctx) return;
+    if (this.ctx.state === 'suspended') this.ctx.resume();
     this.running = false;
     const ctx = this.ctx;
     const t = ctx.currentTime;

@@ -52,7 +52,14 @@ export class CrashSocket extends EventTarget {
       this._route(msg);
     });
 
-    this.ws.addEventListener('close', () => {
+    this.ws.addEventListener('close', (ev) => {
+      if (ev.code === 4001) { // session ouverte ailleurs : pas de reconnexion en boucle
+        this._stopped = true;
+        this._stopHeartbeat();
+        this._clearAllPending();
+        this._emit('status', { state: 'replaced' });
+        return;
+      }
       this._stopHeartbeat();
       this._clearAllPending();
       this._emit('status', { state: 'disconnected' });
@@ -66,14 +73,26 @@ export class CrashSocket extends EventTarget {
 
   _startHeartbeat() {
     this._stopHeartbeat();
+    const sock = this.ws;
+    this._lastRx = performance.now();
+    this._lastBeat = this._lastRx;
+    this._misses = 0;
+    // Tout message reçu (tick compris) prouve que la connexion est vivante.
+    sock.addEventListener('message', () => { this._lastRx = performance.now(); this._misses = 0; });
     this._hbInterval = setInterval(() => {
-      if (this.ws?.readyState !== WebSocket.OPEN) return;
-      this.ws.send(JSON.stringify({ action: 'ping' }));
+      if (this.ws !== sock || sock.readyState !== WebSocket.OPEN) return;
+      const now = performance.now();
+      const drift = now - this._lastBeat;
+      this._lastBeat = now;
+      // Timers gelés/throttlés (écran éteint, onglet caché) : on ne juge pas la connexion.
+      if (drift > this.heartbeatIntervalMs * 1.8 || document.hidden) { this._lastRx = now; this._misses = 0; return; }
+      sock.send(JSON.stringify({ action: 'ping' }));
       clearTimeout(this._hbTimeout);
       this._hbTimeout = setTimeout(() => {
-        // Pas de pong à temps -> connexion probablement zombie, on force la reconnexion
+        if (performance.now() - this._lastRx < this.heartbeatTimeoutMs) return; // du trafic est arrivé entre-temps
+        if (++this._misses < 2) return; // 2 silences consécutifs avant verdict
         this._emit('status', { state: 'stale' });
-        this.ws?.close();
+        sock.close();
       }, this.heartbeatTimeoutMs);
     }, this.heartbeatIntervalMs);
   }
@@ -90,6 +109,7 @@ export class CrashSocket extends EventTarget {
   }
 
   _scheduleReconnect() {
+    if (this._stopped) return;
     const base = Math.min(500 * 2 ** this.reconnectAttempts, this.maxReconnectDelay);
     const jitter = base * (0.5 + Math.random() * 0.5); // 50%-100% du délai, évite le thundering herd
     this.reconnectAttempts++;
