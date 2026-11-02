@@ -3,104 +3,75 @@
 set -Eeuo pipefail
 
 # ============================================================
-# 223GAMING STUDIO
-# STARTUP ORCHESTRATOR
-# Provider Core + Game Products
+# 223GAMING STUDIO • STARTUP ORCHESTRATOR
+# Provider Core + 223CRASH + MockWallet
+# Intelligent / Idempotent Startup
 # ============================================================
 
 PROJECT_DIR="${HOME}/223Gaming/223Crash"
-cd "$PROJECT_DIR"
+cd "$PROJECT_DIR" || exit 1
 
-# ============================================================
 # COLORS
-# ============================================================
-
 if [[ -t 1 ]]; then
     RESET=$'\033[0m'
     BOLD=$'\033[1m'
-    RED=$'\033[31m'
-    GREEN=$'\033[32m'
-    YELLOW=$'\033[33m'
-    BLUE=$'\033[34m'
-    MAGENTA=$'\033[35m'
-    CYAN=$'\033[36m'
-    WHITE=$'\033[37m'
+    RED=$'\033[1;91m'
+    GREEN=$'\033[1;92m'
+    YELLOW=$'\033[1;93m'
+    BLUE=$'\033[1;94m'
+    MAGENTA=$'\033[1;95m'
+    CYAN=$'\033[1;96m'
+    WHITE=$'\033[1;97m'
 else
-    RESET=""
-    BOLD=""
-    RED=""
-    GREEN=""
-    YELLOW=""
-    BLUE=""
-    MAGENTA=""
-    CYAN=""
-    WHITE=""
+    RESET="" BOLD="" RED="" GREEN=""
+    YELLOW="" BLUE="" MAGENTA="" CYAN="" WHITE=""
 fi
 
-# Compatibility alias used by the Studio header.
-CY="$CYAN"
-
-# ============================================================
 # ENVIRONMENT
-# ============================================================
-
 if [[ -f "$PROJECT_DIR/.env" ]]; then
     set -a
-    # shellcheck disable=SC1091
     source "$PROJECT_DIR/.env"
     set +a
 fi
 
 HOST="${HOST:-127.0.0.1}"
-
 HTTP_PORT="${HTTP_PORT:-8080}"
 WS_PORT="${WS_PORT:-3000}"
 VERIFY_PORT="${VERIFY_PORT:-8090}"
 MOCKWALLET_PORT="${MOCKWALLET_PORT:-9000}"
+START_MOCKWALLET="${START_MOCKWALLET:-1}"
 
-START_MOCKWALLET="${START_MOCKWALLET:-0}"
+export GOFLAGS="${GOFLAGS:--p=1}"
+export GOGC="${GOGC:-50}"
+export CGO_ENABLED="${CGO_ENABLED:-0}"
 
-# ============================================================
 # DIRECTORIES
-# ============================================================
-
 BIN_DIR="$PROJECT_DIR/bin"
 LOG_DIR="$PROJECT_DIR/logs"
 RUNTIME_DIR="$PROJECT_DIR/.runtime"
 PID_DIR="$RUNTIME_DIR/pids"
 
-mkdir -p \
-    "$BIN_DIR" \
-    "$LOG_DIR" \
-    "$PID_DIR"
+mkdir -p "$BIN_DIR" "$LOG_DIR" "$PID_DIR"
 
-# ============================================================
+# BINARIES
+SERVER_BIN="$BIN_DIR/server"
+MOCKWALLET_BIN="$BIN_DIR/mockwallet"
+
 # PID FILES
-# ============================================================
-
 PROVIDER_PID_FILE="$PID_DIR/provider-server.pid"
 MOCKWALLET_PID_FILE="$PID_DIR/mockwallet.pid"
 
-# ============================================================
-# LOG FILES
-# ============================================================
+# LEGACY PID FILES
+LEGACY_PROVIDER_PID="$LOG_DIR/go.pid"
+LEGACY_MOCK_PID="$LOG_DIR/mockwallet.pid"
 
+# LOG FILES
 PROVIDER_LOG="$LOG_DIR/provider-server.log"
 MOCKWALLET_LOG="$LOG_DIR/mockwallet.log"
 BUILD_LOG="$LOG_DIR/build.log"
 MOCK_BUILD_LOG="$LOG_DIR/build-mockwallet.log"
 
-# ============================================================
-# BINARIES
-# ============================================================
-
-SERVER_BIN="$BIN_DIR/server"
-MOCKWALLET_BIN="$BIN_DIR/mockwallet"
-
-# ============================================================
 # FUNCTIONS
-# ============================================================
-
 die() {
     printf "\n${RED}${BOLD}ERROR:${RESET} %s\n" "$*" >&2
     exit 1
@@ -123,69 +94,79 @@ section() {
 }
 
 pid_alive() {
-    local pid="$1"
-
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    kill -0 "$pid" 2>/dev/null
+    [[ "$1" =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null
 }
 
 pid_matches_binary() {
     local pid="$1"
     local expected="$2"
+    local exe
 
     pid_alive "$pid" || return 1
 
-    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    exe="${exe% (deleted)}"
 
-    local cmdline
-    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-
-    [[ "$cmdline" == *"$expected"* ]]
+    [[ "$exe" == "$expected" ]]
 }
 
-read_pid() {
-    local pid_file="$1"
+# Find a process by its actual executable, not only PID files.
+find_process() {
+    local expected="$1"
+    local proc_dir pid exe
 
-    [[ -f "$pid_file" ]] || return 1
+    for proc_dir in /proc/[0-9]*; do
+        [[ -d "$proc_dir" ]] || continue
+
+        pid="${proc_dir##*/}"
+        [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+
+        exe="$(readlink "$proc_dir/exe" 2>/dev/null || true)"
+        exe="${exe% (deleted)}"
+
+        if [[ "$exe" == "$expected" ]]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+read_pid_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
 
     local pid
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    pid="$(cat "$file" 2>/dev/null || true)"
 
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-
-    printf '%s' "$pid"
+    printf '%s\n' "$pid"
 }
 
-cleanup_stale_pid() {
-    local pid_file="$1"
-    local expected_binary="$2"
+save_provider_pid() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
 
-    if [[ ! -f "$pid_file" ]]; then
-        return 0
-    fi
+    printf '%s\n' "$pid" > "$PROVIDER_PID_FILE"
+    printf '%s\n' "$pid" > "$LEGACY_PROVIDER_PID"
+}
 
-    local pid
-    pid="$(read_pid "$pid_file" || true)"
+save_mock_pid() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
 
-    if [[ -z "$pid" ]]; then
-        rm -f "$pid_file"
-        return 0
-    fi
-
-    if pid_matches_binary "$pid" "$expected_binary"; then
-        die "Process already running: $expected_binary (PID $pid)"
-    fi
-
-    rm -f "$pid_file"
+    printf '%s\n' "$pid" > "$MOCKWALLET_PID_FILE"
+    printf '%s\n' "$pid" > "$LEGACY_MOCK_PID"
 }
 
 wait_for_http() {
     local url="$1"
-    local attempts="${2:-30}"
-
+    local attempts="${2:-20}"
     local i
+
     for ((i=1; i<=attempts; i++)); do
-        if curl -fsS --max-time 1 "$url" >/dev/null 2>&1; then
+        if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.5
@@ -199,21 +180,42 @@ port_reachable() {
     local port="$2"
 
     if command -v nc >/dev/null 2>&1; then
-        nc -z "$host" "$port" >/dev/null 2>&1
+        nc -z -w 2 "$host" "$port" >/dev/null 2>&1
         return $?
     fi
 
-    if command -v curl >/dev/null 2>&1; then
-        curl \
-            --silent \
-            --output /dev/null \
-            --max-time 1 \
-            "http://${host}:${port}/" >/dev/null 2>&1
+    curl -sS -o /dev/null --max-time 2 \
+        "http://${host}:${port}/" >/dev/null 2>&1
+}
 
-        return $?
+build_server() {
+    section "BUILD PROVIDER CORE"
+
+    info "Compiling ./cmd/server ..."
+
+    if ! go build -p=1 -o "$SERVER_BIN" ./cmd/server \
+        >"$BUILD_LOG" 2>&1; then
+        cat "$BUILD_LOG" >&2
+        die "Provider Core compilation failed."
     fi
 
-    return 1
+    chmod +x "$SERVER_BIN"
+    success "Provider binary compiled."
+}
+
+build_mockwallet() {
+    section "BUILD MOCKWALLET"
+
+    info "Compiling ./cmd/mockwallet ..."
+
+    if ! go build -p=1 -o "$MOCKWALLET_BIN" ./cmd/mockwallet \
+        >"$MOCK_BUILD_LOG" 2>&1; then
+        cat "$MOCK_BUILD_LOG" >&2
+        die "MockWallet compilation failed."
+    fi
+
+    chmod +x "$MOCKWALLET_BIN"
+    success "MockWallet binary compiled."
 }
 
 # ============================================================
@@ -223,25 +225,19 @@ port_reachable() {
 clear 2>/dev/null || true
 
 BOOT_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
-
-if command -v go >/dev/null 2>&1; then
-    GO_VERSION="$(go version | awk '{print $3}')"
-else
-    GO_VERSION="absent"
-fi
+GO_VERSION="$(go version 2>/dev/null | awk '{print $3}')"
 
 printf "\n"
-printf "${CY}╔══════════════════════════════════════════════════════╗${RESET}\n"
-printf "${CY}║ ${WHITE}${BOLD}223GAMING STUDIO${RESET}${CY} • ${MAGENTA}LAB iGAMING B2B${CY}             ║${RESET}\n"
-printf "${CY}║ ${WHITE}Provider Core + Game Products${CY}                    ║${RESET}\n"
-printf "${CY}╠══════════════════════════════════════════════════════╣${RESET}\n"
-printf "${CY}║ ${YELLOW}${BOLD}FOUNDER & CEO${RESET}${CY}                                  ║${RESET}\n"
-printf "${CY}║ ${WHITE}Tidiane Diallo${CY}                                  ║${RESET}\n"
-printf "${CY}║ ${WHITE}Moteur : Go${CY}                                      ║${RESET}\n"
-printf "${CY}║ ${WHITE}Architecture : Provider B2B${CY}                     ║${RESET}\n"
-printf "${CY}║ ${WHITE}Boot : %-41s${CY} ║${RESET}\n" "$BOOT_TIME"
-printf "${CY}╚══════════════════════════════════════════════════════╝${RESET}\n"
-printf "\n"
+printf "${CYAN}╔══════════════════════════════════════════════════════╗${RESET}\n"
+printf "${CYAN}║ ${WHITE}${BOLD}223GAMING STUDIO${RESET}${CYAN} • ${MAGENTA}LAB iGAMING B2B${CYAN}             ║${RESET}\n"
+printf "${CYAN}║ ${WHITE}Provider Core + Game Products${CYAN}                    ║${RESET}\n"
+printf "${CYAN}╠══════════════════════════════════════════════════════╣${RESET}\n"
+printf "${CYAN}║ ${YELLOW}${BOLD}FOUNDER & CEO${RESET}${CYAN}                                  ║${RESET}\n"
+printf "${CYAN}║ ${WHITE}Tidiane Diallo${CYAN}                                  ║${RESET}\n"
+printf "${CYAN}║ ${WHITE}Engine : Go${CYAN}                                      ║${RESET}\n"
+printf "${CYAN}║ ${WHITE}Architecture : Provider B2B${CYAN}                     ║${RESET}\n"
+printf "${CYAN}║ ${WHITE}Boot : %-41s${CYAN} ║${RESET}\n" "$BOOT_TIME"
+printf "${CYAN}╚══════════════════════════════════════════════════════╝${RESET}\n"
 
 # ============================================================
 # PRECHECK
@@ -249,229 +245,260 @@ printf "\n"
 
 section "PRECHECK"
 
-[[ -d "$PROJECT_DIR" ]] || die "Project directory not found: $PROJECT_DIR"
-
-command -v go >/dev/null 2>&1 \
-    || die "Go is not installed."
-
-command -v curl >/dev/null 2>&1 \
-    || die "curl is required."
+[[ -d "$PROJECT_DIR" ]] || die "Project directory missing."
+command -v go >/dev/null 2>&1 || die "Go unavailable."
+command -v curl >/dev/null 2>&1 || die "curl unavailable."
 
 success "Project : $PROJECT_DIR"
 success "Go      : $GO_VERSION"
 
 # ============================================================
-# STOP DUPLICATE INSTANCES
+# PROVIDER CORE - INTELLIGENT START
 # ============================================================
 
-section "PROCESS CHECK"
+section "PROVIDER CORE"
 
-cleanup_stale_pid "$PROVIDER_PID_FILE" "$SERVER_BIN"
+PROVIDER_PID=""
+PROVIDER_HEALTH=""
 
-if [[ "$START_MOCKWALLET" == "1" ]]; then
-    cleanup_stale_pid "$MOCKWALLET_PID_FILE" "$MOCKWALLET_BIN"
-else
-    if [[ -f "$MOCKWALLET_PID_FILE" ]]; then
-        warn "MockWallet PID file exists but START_MOCKWALLET=0."
-        rm -f "$MOCKWALLET_PID_FILE"
-    fi
-fi
+if wait_for_http "http://${HOST}:${HTTP_PORT}/healthz" 2; then
 
-success "No conflicting Studio process detected."
+    PROVIDER_HEALTH="$(curl -fsS --max-time 2 \
+        "http://${HOST}:${HTTP_PORT}/healthz" 2>/dev/null || true)"
 
-# ============================================================
-# BUILD CONFIGURATION
-# ============================================================
+    PROVIDER_PID="$(find_process "$SERVER_BIN" || true)"
 
-export GOFLAGS="${GOFLAGS:--p=1}"
-export GOGC="${GOGC:-50}"
-export CGO_ENABLED="${CGO_ENABLED:-0}"
-
-section "BUILD CONFIGURATION"
-
-printf "  GOFLAGS      = %s\n" "$GOFLAGS"
-printf "  GOGC         = %s\n" "$GOGC"
-printf "  CGO_ENABLED  = %s\n" "$CGO_ENABLED"
-
-# ============================================================
-# BUILD PROVIDER + CURRENT GAME PRODUCTS
-# ============================================================
-
-section "BUILD PROVIDER CORE"
-
-info "Building ./cmd/server ..."
-
-if ! go build -p=1 -o "$SERVER_BIN" ./cmd/server >"$BUILD_LOG" 2>&1; then
-    cat "$BUILD_LOG" >&2
-    die "Provider build failed."
-fi
-
-chmod +x "$SERVER_BIN"
-
-success "Provider binary ready: $SERVER_BIN"
-
-# ============================================================
-# OPTIONAL MOCK WALLET
-# ============================================================
-
-if [[ "$START_MOCKWALLET" == "1" ]]; then
-
-    section "BUILD MOCK WALLET"
-
-    info "Building ./cmd/mockwallet ..."
-
-    if ! go build -p=1 -o "$MOCKWALLET_BIN" ./cmd/mockwallet >"$MOCK_BUILD_LOG" 2>&1; then
-        cat "$MOCK_BUILD_LOG" >&2
-        die "MockWallet build failed."
+    if [[ -z "$PROVIDER_PID" ]]; then
+        PROVIDER_PID="$(read_pid_file "$PROVIDER_PID_FILE" || true)"
+        if ! pid_matches_binary "$PROVIDER_PID" "$SERVER_BIN"; then
+            PROVIDER_PID=""
+        fi
     fi
 
-    chmod +x "$MOCKWALLET_BIN"
+    if [[ -n "$PROVIDER_PID" ]]; then
+        save_provider_pid "$PROVIDER_PID"
+        success "Existing Provider preserved — PID $PROVIDER_PID"
+    else
+        warn "HTTP is healthy but process ownership could not be established."
+        warn "Existing service will not be restarted."
+    fi
 
-    success "MockWallet binary ready: $MOCKWALLET_BIN"
+    success "HTTP health already OK."
 
 else
 
-    info "MockWallet disabled."
-    info "Use: START_MOCKWALLET=1 ./start.sh"
+    PROVIDER_PID="$(find_process "$SERVER_BIN" || true)"
 
-fi
+    if [[ -n "$PROVIDER_PID" ]]; then
+        save_provider_pid "$PROVIDER_PID"
+        die "Provider PID $PROVIDER_PID exists but HTTP health is failing. No duplicate started."
+    fi
 
-# ============================================================
-# START PROVIDER
-# ============================================================
+    if port_reachable "$HOST" "$HTTP_PORT"; then
+        die "Port $HTTP_PORT is occupied by an unidentified process."
+    fi
 
-section "START PROVIDER CORE"
+    build_server
 
-info "HTTP    : $HOST:$HTTP_PORT"
-info "WebSocket: $HOST:$WS_PORT"
-info "Verify  : $HOST:$VERIFY_PORT"
+    section "START PROVIDER"
 
-nohup "$SERVER_BIN" \
-    >>"$PROVIDER_LOG" 2>&1 &
+    info "Starting Provider Core..."
 
-PROVIDER_PID="$!"
+    nohup "$SERVER_BIN" >>"$PROVIDER_LOG" 2>&1 &
+    PROVIDER_PID="$!"
 
-printf '%s\n' "$PROVIDER_PID" >"$PROVIDER_PID_FILE"
-
-sleep 1
-
-if ! pid_matches_binary "$PROVIDER_PID" "$SERVER_BIN"; then
-    warn "Provider process exited during startup."
-
-    tail -n 80 "$PROVIDER_LOG" >&2 || true
-
-    rm -f "$PROVIDER_PID_FILE"
-
-    die "Provider failed to start."
-fi
-
-success "Provider started — PID $PROVIDER_PID"
-
-# ============================================================
-# HEALTH CHECKS
-# ============================================================
-
-section "HEALTH CHECKS"
-
-info "Checking HTTP health..."
-
-if wait_for_http "http://${HOST}:${HTTP_PORT}/healthz" 30; then
-    success "HTTP /healthz ............. OK"
-else
-    tail -n 80 "$PROVIDER_LOG" >&2 || true
-    die "HTTP health check failed."
-fi
-
-info "Checking verification endpoint..."
-
-if wait_for_http "http://${HOST}:${VERIFY_PORT}/verify/ping" 30; then
-    success "Verify /verify/ping ........ OK"
-else
-    tail -n 80 "$PROVIDER_LOG" >&2 || true
-    die "Verify health check failed."
-fi
-
-info "Checking WebSocket port..."
-
-if port_reachable "$HOST" "$WS_PORT"; then
-    success "WebSocket :$WS_PORT ............ REACHABLE"
-else
-    warn "WebSocket port could not be verified with available tools."
-fi
-
-# ============================================================
-# MOCK WALLET START
-# ============================================================
-
-if [[ "$START_MOCKWALLET" == "1" ]]; then
-
-    section "START MOCK WALLET"
-
-    nohup "$MOCKWALLET_BIN" \
-        >>"$MOCKWALLET_LOG" 2>&1 &
-
-    MOCK_PID="$!"
-
-    printf '%s\n' "$MOCK_PID" >"$MOCKWALLET_PID_FILE"
+    save_provider_pid "$PROVIDER_PID"
 
     sleep 1
 
-    if ! pid_matches_binary "$MOCK_PID" "$MOCKWALLET_BIN"; then
-        warn "MockWallet failed to start."
-        tail -n 80 "$MOCKWALLET_LOG" >&2 || true
-        rm -f "$MOCKWALLET_PID_FILE"
-        die "MockWallet startup failed."
+    if ! pid_matches_binary "$PROVIDER_PID" "$SERVER_BIN"; then
+        tail -n 80 "$PROVIDER_LOG" >&2 || true
+        die "Provider process failed to start."
     fi
 
-    success "MockWallet started — PID $MOCK_PID"
+    success "Provider started — PID $PROVIDER_PID"
 
-    if wait_for_http \
-        "http://${HOST}:${MOCKWALLET_PORT}/wallet/balance?operatorId=default&playerId=demo" \
-        20; then
+    if ! wait_for_http "http://${HOST}:${HTTP_PORT}/healthz" 30; then
+        tail -n 80 "$PROVIDER_LOG" >&2 || true
+        die "Provider HTTP health check failed."
+    fi
 
-        success "MockWallet :$MOCKWALLET_PORT ........ OK"
+    success "Provider HTTP health OK."
+fi
+
+# ============================================================
+# PROVIDER ENDPOINT CHECKS
+# ============================================================
+
+section "PROVIDER HEALTH CHECKS"
+
+HTTP_OK=0
+VERIFY_OK=0
+WS_OK=0
+
+HEALTH_JSON="$(curl -fsS --max-time 3 \
+    "http://${HOST}:${HTTP_PORT}/healthz" 2>/dev/null || true)"
+
+if [[ -n "$HEALTH_JSON" ]]; then
+    HTTP_OK=1
+    success "HTTP :$HTTP_PORT — $HEALTH_JSON"
+else
+    warn "HTTP health unavailable."
+fi
+
+if wait_for_http "http://${HOST}:${VERIFY_PORT}/verify/ping" 4; then
+    VERIFY_OK=1
+    success "Verify :$VERIFY_PORT — OK"
+else
+    warn "Verify endpoint unavailable."
+fi
+
+if port_reachable "$HOST" "$WS_PORT"; then
+    WS_OK=1
+    success "WebSocket :$WS_PORT — REACHABLE"
+else
+    warn "WebSocket :$WS_PORT could not be verified."
+fi
+
+# ============================================================
+# MOCKWALLET - INTELLIGENT START
+# ============================================================
+
+MOCK_PID=""
+MOCK_OK=0
+
+if [[ "$START_MOCKWALLET" == "1" ]]; then
+
+    section "MOCKWALLET"
+
+    MOCK_URL="http://${HOST}:${MOCKWALLET_PORT}/wallet/balance?operatorId=default&playerId=probe"
+
+    if wait_for_http "$MOCK_URL" 2; then
+
+        MOCK_PID="$(find_process "$MOCKWALLET_BIN" || true)"
+
+        if [[ -z "$MOCK_PID" ]]; then
+            MOCK_PID="$(read_pid_file "$MOCKWALLET_PID_FILE" || true)"
+            if ! pid_matches_binary "$MOCK_PID" "$MOCKWALLET_BIN"; then
+                MOCK_PID=""
+            fi
+        fi
+
+        if [[ -n "$MOCK_PID" ]]; then
+            save_mock_pid "$MOCK_PID"
+            success "Existing MockWallet preserved — PID $MOCK_PID"
+        else
+            warn "MockWallet endpoint is healthy; ownership unknown."
+        fi
+
+        MOCK_OK=1
+        success "MockWallet endpoint OK."
 
     else
 
-        warn "MockWallet HTTP check failed."
-        warn "Provider remains running; inspect $MOCKWALLET_LOG"
+        MOCK_PID="$(find_process "$MOCKWALLET_BIN" || true)"
 
+        if [[ -n "$MOCK_PID" ]]; then
+            save_mock_pid "$MOCK_PID"
+            die "MockWallet PID $MOCK_PID exists but health check fails."
+        fi
+
+        if port_reachable "$HOST" "$MOCKWALLET_PORT"; then
+            die "MockWallet port $MOCKWALLET_PORT occupied by unidentified process."
+        fi
+
+        build_mockwallet
+
+        section "START MOCKWALLET"
+
+        nohup "$MOCKWALLET_BIN" >>"$MOCKWALLET_LOG" 2>&1 &
+        MOCK_PID="$!"
+
+        save_mock_pid "$MOCK_PID"
+
+        sleep 1
+
+        if ! pid_matches_binary "$MOCK_PID" "$MOCKWALLET_BIN"; then
+            tail -n 80 "$MOCKWALLET_LOG" >&2 || true
+            die "MockWallet failed to start."
+        fi
+
+        if ! wait_for_http "$MOCK_URL" 20; then
+            tail -n 80 "$MOCKWALLET_LOG" >&2 || true
+            die "MockWallet health check failed."
+        fi
+
+        MOCK_OK=1
+        success "MockWallet started — PID $MOCK_PID"
     fi
 
+else
+    warn "MockWallet disabled by START_MOCKWALLET=0."
 fi
 
 # ============================================================
-# FINAL STATUS
+# FINAL REPORT
 # ============================================================
+
+section "FINAL SYSTEM STATUS"
+
+[[ "$HTTP_OK" -eq 1 ]] && success "Provider HTTP :$HTTP_PORT ONLINE" \
+    || warn "Provider HTTP OFFLINE"
+
+[[ "$VERIFY_OK" -eq 1 ]] && success "Verify :$VERIFY_PORT ONLINE" \
+    || warn "Verify OFFLINE"
+
+[[ "$WS_OK" -eq 1 ]] && success "WebSocket :$WS_PORT REACHABLE" \
+    || warn "WebSocket UNVERIFIED"
+
+if [[ "$START_MOCKWALLET" == "1" ]]; then
+    [[ "$MOCK_OK" -eq 1 ]] && success "MockWallet :$MOCKWALLET_PORT ONLINE" \
+        || warn "MockWallet OFFLINE"
+fi
+
+if echo "$HEALTH_JSON" | grep -q '"mongo":"connected"'; then
+    success "MongoDB Atlas CONNECTED"
+else
+    warn "MongoDB Atlas not confirmed connected."
+fi
 
 printf "\n"
 printf "${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗${RESET}\n"
-printf "${GREEN}${BOLD}║              223GAMING STUDIO ONLINE                ║${RESET}\n"
+printf "${GREEN}${BOLD}║              223GAMING STUDIO STATUS                ║${RESET}\n"
 printf "${GREEN}${BOLD}╠══════════════════════════════════════════════════════╣${RESET}\n"
-printf "${GREEN}║${RESET} Provider Core      : ${GREEN}ONLINE${RESET}                     ${GREEN}║${RESET}\n"
-printf "${GREEN}║${RESET} 223CRASH           : ${GREEN}ACTIVE${RESET}                     ${GREEN}║${RESET}\n"
-printf "${GREEN}║${RESET} HTTP               : ${WHITE}:%-4s${RESET}                     ${GREEN}║${RESET}\n" "$HTTP_PORT"
-printf "${GREEN}║${RESET} WebSocket          : ${WHITE}:%-4s${RESET}                     ${GREEN}║${RESET}\n" "$WS_PORT"
-printf "${GREEN}║${RESET} Verify             : ${WHITE}:%-4s${RESET}                     ${GREEN}║${RESET}\n" "$VERIFY_PORT"
+
+printf "${GREEN}║${RESET} Provider Core : ${GREEN}%-33s${RESET}${GREEN}║${RESET}\n" "$([[ "$HTTP_OK" -eq 1 ]] && echo ONLINE || echo DEGRADED)"
+printf "${GREEN}║${RESET} 223CRASH      : ${GREEN}%-33s${RESET}${GREEN}║${RESET}\n" "$([[ "$HTTP_OK" -eq 1 ]] && echo ACTIVE || echo DEGRADED)"
+printf "${GREEN}║${RESET} HTTP          : ${WHITE}:%-4s${RESET}                            ${GREEN}║${RESET}\n" "$HTTP_PORT"
+printf "${GREEN}║${RESET} WebSocket     : ${WHITE}:%-4s${RESET}                            ${GREEN}║${RESET}\n" "$WS_PORT"
+printf "${GREEN}║${RESET} Verify        : ${WHITE}:%-4s${RESET}                            ${GREEN}║${RESET}\n" "$VERIFY_PORT"
 
 if [[ "$START_MOCKWALLET" == "1" ]]; then
-    printf "${GREEN}║${RESET} MockWallet         : ${YELLOW}DEV :%-4s${RESET}                  ${GREEN}║${RESET}\n" "$MOCKWALLET_PORT"
-else
-    printf "${GREEN}║${RESET} MockWallet         : ${WHITE}DISABLED${RESET}                  ${GREEN}║${RESET}\n"
+    printf "${GREEN}║${RESET} MockWallet    : ${WHITE}:%-4s${RESET}                            ${GREEN}║${RESET}\n" "$MOCKWALLET_PORT"
 fi
 
-printf "${GREEN}║${RESET} Provider PID       : ${WHITE}%-29s${RESET}${GREEN}║${RESET}\n" "$PROVIDER_PID"
+printf "${GREEN}║${RESET} Provider PID  : ${WHITE}%-33s${RESET}${GREEN}║${RESET}\n" "${PROVIDER_PID:-EXTERNAL/UNKNOWN}"
 printf "${GREEN}╚══════════════════════════════════════════════════════╝${RESET}\n"
 
 printf "\n"
 info "Logs:"
-printf "  Provider : %s\n" "$PROVIDER_LOG"
-printf "  Build    : %s\n" "$BUILD_LOG"
+printf "  Provider : $PROVIDER_LOG\n"
+printf "  Build    : $BUILD_LOG\n"
 
 if [[ "$START_MOCKWALLET" == "1" ]]; then
-    printf "  Mock     : %s\n" "$MOCKWALLET_LOG"
+    printf "  Mock     : $MOCKWALLET_LOG\n"
 fi
 
 printf "\n"
 info "Stop Studio: ./stop.sh"
-printf "\n"
+
+# Critical endpoint validation
+if [[ "$HTTP_OK" -ne 1 || "$VERIFY_OK" -ne 1 ]]; then
+    exit 1
+fi
+
+if [[ "$START_MOCKWALLET" == "1" && "$MOCK_OK" -ne 1 ]]; then
+    exit 1
+fi
+
+exit 0
