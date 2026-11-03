@@ -322,6 +322,7 @@ func (gw *gateway) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	go gw.readPump(c)
 
 	c.sendJSON(map[string]any{"type": "CONNECTED", "playerId": c.playerID})
+	gw.syncRoundState(c)
 
 	balCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	balance, err := gw.walletClient.GetBalance(balCtx, c.operatorID, c.playerID)
