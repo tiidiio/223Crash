@@ -493,7 +493,7 @@ func isValidMultiplier(multiplier float64) bool {
 }
 
 func normalizeMultiplier(multiplier float64) float64 {
-	return math.Floor(multiplier*100) / 100
+	return math.Floor(multiplier*100+1e-7) / 100 // +1e-7 : absorbe 1.15*100=114.99999999999999 (idempotence)
 }
 
 func cloneBet(bet *Bet) *Bet {
