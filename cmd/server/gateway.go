@@ -133,6 +133,7 @@ type gateway struct {
 	walletClient *wallet.Client
 	walletQueue  *wallet.Queue
 	ledger       *ledger.Ledger
+	credits      *creditSettler
 
 	mu      sync.RWMutex
 	clients map[string]*client // playerID -> client
@@ -145,6 +146,7 @@ func newGateway(eng *engine.CrashEngine, jwtSecret string, walletClient *wallet.
 		walletClient: walletClient,
 		walletQueue:  walletQueue,
 		ledger:       ldg,
+		credits:      newCreditSettler(ldg, walletQueue, productGameID),
 		clients:      make(map[string]*client),
 	}
 }
@@ -186,43 +188,20 @@ func (gw *gateway) broadcast(msgType string, data map[string]any) {
 // bet.Payout est en centimes (même unité que le DEBIT initial) — reconverti en unité
 // majeure uniquement pour l'affichage client (CASHOUT_ACCEPTED).
 //
-// Scope Tranche 3 : une entrée Ledger EntryCredit est ouverte et corrélée au Callback avant
-// l'enqueue, mais reste PENDING après — la Queue n'est pas encore Ledger-aware (Tranche 3bis).
-// Ce n'est pas une perte de traçabilité : l'entrée existe, avec son TransactionID, prête à être
-// résolue dès que la Queue saura appeler Confirm/Fail. Hors scope C2 (idempotency DEBIT) —
-// inchangé, à l'exception de l'adaptation mécanique au nouveau retour à 3 valeurs de Begin.
+// Le règlement du gain est délégué à creditSettler (credit_settle.go) : l'entrée Ledger
+// EntryCredit est ouverte AVANT tout envoi, aucun callback CREDIT ne part sans TransactionID,
+// seul le créateur de l'entrée enfile le callback (pas de double envoi), et un échec de Begin ou
+// d'Enqueue reste récupérable (reprise en arrière-plan / Provider Recovery). Les appels sont
+// bornés dans le temps : cette méthode est aussi appelée depuis la boucle de ticks (auto-cashout).
 func (gw *gateway) settleCashout(c *client, bet *game.Bet) {
 	if bet.Payout > 0 {
-		entry, _, err := gw.ledger.Begin(context.Background(), ledger.NewEntry{
-			GameID:         productGameID,
-			OperatorID:     ledger.OperatorID(c.operatorID),
-			PlayerID:       ledger.PlayerID(c.playerID),
-			ExternalRef:    ledger.ExternalRef(fmt.Sprintf("round=%s|bet=%s", bet.RoundID, bet.ID)),
-			IdempotencyKey: ledger.IdempotencyKey(fmt.Sprintf("credit:%s:%s:%s", c.operatorID, c.playerID, bet.ID)),
-			Type:           ledger.EntryCredit,
-			AmountMinor:    bet.Payout,
+		gw.credits.Settle(creditRequest{
+			OperatorID:  c.operatorID,
+			PlayerID:    c.playerID,
+			RoundID:     bet.RoundID,
+			BetID:       bet.ID,
+			AmountMinor: bet.Payout,
 		})
-		if err != nil {
-			log.Printf("ledger: begin credit bet=%s: %v", bet.ID, err)
-		}
-
-		cb := wallet.Callback{
-			ID:             fmt.Sprintf("credit-%s-%s-%s", c.operatorID, c.playerID, bet.ID),
-			Type:           wallet.CallbackCredit,
-			GameID:         productGameID,
-			OperatorID:     c.operatorID,
-			PlayerID:       c.playerID,
-			RoundID:        bet.RoundID,
-			BetID:          bet.ID,
-			Amount:         bet.Payout,
-			IdempotencyKey: fmt.Sprintf("credit:%s:%s:%s", c.operatorID, c.playerID, bet.ID),
-		}
-		if entry != nil {
-			cb.TransactionID = entry.TransactionID
-		}
-		if err := gw.walletQueue.Enqueue(context.Background(), cb); err != nil {
-			log.Printf("wallet: enqueue CREDIT bet=%s: %v", bet.ID, err)
-		}
 	}
 
 	c.mu.Lock()
