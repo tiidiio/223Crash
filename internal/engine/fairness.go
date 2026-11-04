@@ -10,8 +10,14 @@ import (
 	"strconv"
 )
 
-// HouseEdgePercent définit le RTP cible (97%) utilisé dans le calcul du crash point.
+// HouseEdgePercent définit le RTP cible (97%) utilisé dans le calcul du crash point
+// (nom historique : la valeur est le RTP, pas la marge).
 const HouseEdgePercent = 97.0
+
+// MaxCrashPoint est le multiplicateur de crash maximal d'un round. Il borne l'exposition
+// de l'opérateur par round. Pour toute cible de cashout t <= MaxCrashPoint, le RTP reste
+// celui de HouseEdgePercent : P(crash >= t) = 0.97/t n'est pas modifié par le plafond.
+const MaxCrashPoint = 5000.0
 
 // verifyTolerance absorbe les erreurs d'arrondi flottant lors de la ré-vérification
 // publique d'un crash point (valeur ayant transité par JSON/Mongo côté client).
@@ -39,17 +45,28 @@ func NextClientSeed(prevRevealedServerSeed string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// crashFromX convertit X ∈ [0, 1[ en multiplicateur de crash :
+//
+//	crash = min(MaxCrashPoint, max(1.00, floor(HouseEdgePercent / (1 - X)) / 100))
+//
+// X ne peut jamais valoir 1 (e est borné à 2^52 - 1), donc (1 - X) n'est jamais nul.
+// X proche de 0 produit un crash inférieur à 1.00, ramené au plancher 1.00x.
+func crashFromX(x float64) float64 {
+	crash := math.Floor(HouseEdgePercent/(1-x)) / 100.0
+	if crash < 1.00 {
+		crash = 1.00
+	}
+	if crash > MaxCrashPoint {
+		crash = MaxCrashPoint
+	}
+	return crash
+}
+
 // CrashPoint calcule le multiplicateur de crash déterministe d'un round.
 //
 // h = HMAC-SHA256(serverSeed, "clientSeed:nonce"), tronqué aux 52 premiers bits
-// (13 caractères hex) en un entier e ∈ [0, 2^52 - 1].
-// X = e / 2^52 ∈ [0, 1[ — X ne peut JAMAIS atteindre 1 puisque e est strictement
-// borné à 2^52 - 1, donc (1 - X) ne peut jamais être nul : aucune protection
-// division-par-zéro n'est nécessaire ici (contrairement à une version antérieure
-// qui gardait à tort contre X == 0, un cas qui produit simplement le crash point
-// minimal 1.00x, déjà couvert par le clamp final).
-//
-// crash = floor(HouseEdgePercent / (1 - X)) / 100
+// (13 caractères hex) en un entier e ∈ [0, 2^52 - 1], puis X = e / 2^52 ∈ [0, 1[.
+// Le crash point est ensuite calculé par crashFromX (plancher 1.00x, plafond MaxCrashPoint).
 func CrashPoint(serverSeed, clientSeed string, nonce int64) (float64, error) {
 	mac := hmac.New(sha256.New, []byte(serverSeed))
 	if _, err := mac.Write([]byte(fmt.Sprintf("%s:%d", clientSeed, nonce))); err != nil {
@@ -64,14 +81,7 @@ func CrashPoint(serverSeed, clientSeed string, nonce int64) (float64, error) {
 	}
 
 	const maxE = float64(uint64(1) << 52)
-	x := float64(e) / maxE
-
-	crash := math.Floor(HouseEdgePercent/(1-x)) / 100.0
-	if crash < 1.00 {
-		crash = 1.00
-	}
-
-	return crash, nil
+	return crashFromX(float64(e) / maxE), nil
 }
 
 // VerifyCrashPoint recalcule le crash point à partir du server seed révélé, pour l'audit
