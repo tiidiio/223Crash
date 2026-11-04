@@ -106,6 +106,10 @@ func gwtNewEnv(t *testing.T, op *gwtOperator, bettingWindow time.Duration) *gwtE
 	if uri == "" {
 		t.Skip("MONGO_TEST_URI absent : test d'intégration gateway ignoré")
 	}
+	// La config de sécurité WS est chargée paresseusement (sync.Once) à la première utilisation,
+	// pendant handleBet, et elle est fail-closed (log.Fatal) sans opérateur autorisé. Les tests
+	// utilisent l'opérateur "op1" ; la première valeur chargée vaut pour tout le process de test.
+	t.Setenv("ALLOWED_OPERATORS", "op1")
 	slot, panel := gwtPickSlot(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -233,18 +237,27 @@ func gwtClient(operatorID, playerID string) *client {
 	}
 }
 
+// gwtRecv renvoie le prochain message de réponse du client. Les messages BALANCE sont des
+// notifications de solde asynchrones (rafraîchissement après mouvement wallet) : elles peuvent
+// précéder ou suivre BET_ACCEPTED / BET_REJECTED et sont ignorées ici.
 func gwtRecv(t *testing.T, c *client, d time.Duration) map[string]any {
 	t.Helper()
-	select {
-	case b := <-c.send:
-		var m map[string]any
-		if err := json.Unmarshal(b, &m); err != nil {
-			t.Fatalf("réponse non JSON: %v (%s)", err, b)
+	timeout := time.After(d)
+	for {
+		select {
+		case b := <-c.send:
+			var m map[string]any
+			if err := json.Unmarshal(b, &m); err != nil {
+				t.Fatalf("réponse non JSON: %v (%s)", err, b)
+			}
+			if gwtType(m) == "BALANCE" {
+				continue
+			}
+			return m
+		case <-timeout:
+			t.Fatalf("aucune réponse client sous %s", d)
+			return nil
 		}
-		return m
-	case <-time.After(d):
-		t.Fatalf("aucune réponse client sous %s", d)
-		return nil
 	}
 }
 
