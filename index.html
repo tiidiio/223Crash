@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>223CRASH</title>
+<link rel="stylesheet" href="style.css?v=bets1">
+</head>
+<body>
+
+<div id="topbar">
+  <div id="connection-status" data-state="disconnected"></div>
+  <div id="balance-display">--</div>
+  <div id="round-id"></div>
+</div>
+
+<div id="multiplier-zone">
+  <canvas id="game-canvas"></canvas>
+  <div id="multiplier-display">1.00x</div>
+  <div id="round-state">en attente</div>
+</div>
+
+<div id="history-strip"></div>
+
+<div id="panels"></div>
+
+<script type="module">
+  import { HeliSound } from './heli-sound.js?v=heli2';
+  const heli = new HeliSound();
+  try { heli.setMuted(localStorage.getItem('heliMuted') === '1'); } catch (_) {}
+  const heliGestures = ['pointerdown', 'keydown', 'touchend'];
+  const unlockHeli = () => {
+    heli.unlock().then(() => {
+      heliGestures.forEach((ev) => window.removeEventListener(ev, unlockHeli, true));
+    }).catch(() => {});
+  };
+  heliGestures.forEach((ev) => window.addEventListener(ev, unlockHeli, true));
+  const heliBtn = document.createElement('button');
+  heliBtn.type = 'button';
+  heliBtn.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:50;padding:4px 10px;font-size:16px;line-height:1;background:rgba(20,23,29,.85);color:#D4A54A;border:1px solid #D4A54A;border-radius:6px;cursor:pointer';
+  const paintHeliBtn = () => {
+    heliBtn.textContent = heli.muted ? '🔇' : '🔊';
+    heliBtn.setAttribute('aria-label', heli.muted ? 'Activer le son' : 'Couper le son');
+  };
+  heliBtn.addEventListener('click', () => {
+    heli.setMuted(!heli.muted);
+    try { localStorage.setItem('heliMuted', heli.muted ? '1' : '0'); } catch (_) {}
+    paintHeliBtn();
+  });
+  paintHeliBtn();
+  document.body.appendChild(heliBtn);
+import { CrashSocket } from './ws.js?v=sess1';
+import { initBets } from './bets.js?v=bets1';
+
+const params = new URLSearchParams(location.search);
+const token = params.get('token');
+
+// Le token ne doit pas rester visible dans la barre d'adresse / l'historique.
+if (token) {
+  history.replaceState(null, '', location.pathname);
+}
+
+if (!token) {
+  document.getElementById('round-state').textContent = 'token manquant';
+} else {
+  const wsProtocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const wsUrl = `${wsProtocol}${location.hostname}:3000`;
+  const socket = new CrashSocket({ url: wsUrl, token });
+
+  const statusEl = document.getElementById('connection-status');
+  const balanceEl = document.getElementById('balance-display');
+  const roundIdEl = document.getElementById('round-id');
+  const multEl = document.getElementById('multiplier-display');
+  const roundStateEl = document.getElementById('round-state');
+  const zoneEl = document.getElementById('multiplier-zone');
+  const historyEl = document.getElementById('history-strip');
+  const panelsEl = document.getElementById('panels');
+  const canvas = document.getElementById('game-canvas');
+  const ctx = canvas.getContext('2d');
+
+  /* =====================================================================
+     SCÈNE — hélicoptère militaire (canvas pur, zéro asset)
+     Source de vérité = elapsedMs serveur (resync à chaque TICK).
+     ===================================================================== */
+
+  const DPR = Math.min(window.devicePixelRatio || 1, 2);
+  const TILE = 960;
+  const TWO_PI = Math.PI * 2;
+  let W = 0, H = 0, S = 1, GY = 0;
+
+  function resizeCanvas() {
+    W = zoneEl.clientWidth;
+    H = zoneEl.clientHeight;
+    if (!W || !H) return;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    S = Math.max(0.62, Math.min(1.15, W / 460));
+    GY = H - 38;
+  }
+  resizeCanvas();
+  if (window.ResizeObserver) new ResizeObserver(resizeCanvas).observe(zoneEl);
+  else window.addEventListener('resize', resizeCanvas);
+
+  // formule engine confirmée : e^(0.00006 * elapsedMs)
+  function multiplierAt(elapsedMs) {
+    return Math.exp(0.00006 * elapsedMs);
+  }
+
+  // ---------- monde procédural (déterministe, tuilé) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function makeSkyline(seed, wMin, wMax, hMin, hMax) {
+    const rnd = mulberry32(seed);
+    const arr = [];
+    let x = 0;
+    while (x < TILE) {
+      const w = wMin + rnd() * (wMax - wMin);
+      arr.push({ x, w, h: hMin + rnd() * (hMax - hMin), id: arr.length });
+      x += w + rnd() * 5;
+    }
+    const f = TILE / x;
+    arr.forEach((b) => { b.x *= f; b.w *= f; });
+    return arr;
+  }
+
+  const SKY_FAR = makeSkyline(101, 30, 70, 30, 90);
+  const SKY_MID = makeSkyline(202, 24, 56, 24, 70);
+  const rndW = mulberry32(2231);
+  const STARS = Array.from({ length: 70 }, () => ({ x: rndW() * TILE, y: rndW(), r: 0.7 + rndW() * 1.3, tw: rndW() * TWO_PI }));
+  const CLOUDS = Array.from({ length: 6 }, () => ({ x: rndW() * TILE, y: 0.12 + rndW() * 0.5, w: 80 + rndW() * 100, s: 0.7 + rndW() * 0.6 }));
+
+  function eachTile(scroll, cb) {
+    const off = -(((scroll % TILE) + TILE) % TILE);
+    for (let ox = off; ox < W; ox += TILE) cb(ox);
+  }
+
+  function dot(x, y, r) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, TWO_PI);
+    ctx.fill();
+  }
+
+  // ---------- trajectoire : 100% fonction de elapsedMs ----------
+  // Marges calées sur l'envergure de l'hélico (queue ~96, rotor/nez ~78) pour ne jamais être coupé.
+  const x0 = () => Math.max(W * 0.2, 104 * S);
+  const xMax = () => Math.max(x0() + 20, W - 92 * S);
+  const y0 = () => GY - 32 * S;       // roues posées sur le pad
+  const yTop = () => H * 0.42;
+
+  // Profil hélico : montée quasi verticale, stabilisation, puis translation vers l'avant.
+  const HC_CLIMB_MS = 1700;
+  const HC_HOVER_Y = 0.36;
+  const hcEase = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  function pos(e) {
+    const b = posBase(e);
+    const x0v = x0(), span = xMax() - x0v;
+    const yG = y0(), yH = H * HC_HOVER_Y;
+    let x, y;
+    if (e < HC_CLIMB_MS) {
+      x = x0v;
+      y = yG - (yG - yH) * hcEase(e / HC_CLIMB_MS);
+    } else {
+      const t = e - HC_CLIMB_MS;
+      x = x0v + span * 0.92 * (1 - Math.exp(-t / 3500));
+      y = yH - Math.min(1, t / 20000) * H * 0.05;
+    }
+    return Object.assign({}, b, { x, y });
+  }
+
+  function posBase(e) {
+    const m = multiplierAt(e);
+    const r = 1 - 1 / (1 + (m - 1) * 0.6);
+    const p = 1 - Math.exp(-e / 9000);
+    return {
+      x: x0() + p * (xMax() - x0()),
+      y: y0() - r * (y0() - yTop()),
+      r,
+    };
+  }
+
+  // ---------- décor ----------
+  function drawSky(r) {
+    const g = ctx.createLinearGradient(0, 0, 0, GY);
+    g.addColorStop(0, '#2F86D6');
+    g.addColorStop(0.55, '#74B8EC');
+    g.addColorStop(1, '#D3EAF8');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    const glow = ctx.createRadialGradient(W * 0.5, GY, 0, W * 0.5, GY, W * 0.7);
+    glow.addColorStop(0, `rgba(255,246,220,${0.45 * (1 - r * 0.6)})`);
+    glow.addColorStop(1, 'rgba(255,246,220,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // Soleil (le nom drawMoon est conservé : il est appelé par render()).
+  function drawMoon(r) {
+    const mx = W * 0.82, my = H * 0.2 + r * 18;
+    const t = performance.now() / 1000;
+    const halo = ctx.createRadialGradient(mx, my, 0, mx, my, 90 * S);
+    halo.addColorStop(0, 'rgba(255,244,190,0.75)');
+    halo.addColorStop(0.35, 'rgba(255,236,160,0.28)');
+    halo.addColorStop(1, 'rgba(255,236,160,0)');
+    ctx.fillStyle = halo;
+    dot(mx, my, 90 * S);
+    ctx.save();
+    ctx.translate(mx, my);
+    ctx.rotate(t * 0.05);
+    ctx.strokeStyle = 'rgba(255,240,170,0.35)';
+    ctx.lineWidth = 2.2 * S;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (let k = 0; k < 14; k++) {
+      const a = (k * TWO_PI) / 14;
+      const r0 = 24 * S, r1 = (k % 2 ? 38 : 48) * S;
+      ctx.moveTo(Math.cos(a) * r0, Math.sin(a) * r0);
+      ctx.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
+    }
+    ctx.stroke();
+    ctx.restore();
+    const d = ctx.createRadialGradient(mx - 4 * S, my - 4 * S, 0, mx, my, 17 * S);
+    d.addColorStop(0, '#FFFBE0');
+    d.addColorStop(0.7, '#FFE680');
+    d.addColorStop(1, '#FFC93C');
+    ctx.fillStyle = d;
+    dot(mx, my, 17 * S);
+  }
+
+  function drawStars() { /* de jour : pas d'étoiles */ }
+
+  function drawClouds(scroll, r) {
+    eachTile(scroll, (ox) => {
+      for (const c of CLOUDS) {
+        const cx = ox + c.x;
+        const w = c.w * S;
+        if (cx < -w || cx > W + w) continue;
+        const cy = c.y * H * 0.7 + r * 28;
+        ctx.fillStyle = 'rgba(120,150,180,0.16)';
+        ctx.beginPath(); ctx.ellipse(cx, cy + 3 * S, w * 0.5, 9 * S * c.s, 0, 0, TWO_PI); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.92)';
+        ctx.beginPath(); ctx.ellipse(cx, cy, w * 0.5, 9 * S * c.s, 0, 0, TWO_PI); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(cx + w * 0.22, cy - 6 * S, w * 0.3, 8 * S * c.s, 0, 0, TWO_PI); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(cx - w * 0.2, cy - 4 * S, w * 0.24, 7 * S * c.s, 0, 0, TWO_PI); ctx.fill();
+      }
+    });
+  }
+
+  function drawSkyline(layer, scroll, color, windows) {
+    ctx.fillStyle = color;
+    eachTile(scroll, (ox) => {
+      for (const b of layer) {
+        const bx = ox + b.x;
+        if (bx > W || bx + b.w < 0) continue;
+        const bh = b.h * S;
+        ctx.fillRect(bx, GY - bh, b.w + 1, bh);
+      }
+    });
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    eachTile(scroll, (ox) => {
+      for (const b of layer) {
+        const bx = ox + b.x;
+        if (bx > W || bx + b.w < 0) continue;
+        ctx.fillRect(bx, GY - b.h * S, b.w + 1, 2);
+      }
+    });
+    if (!windows) return;
+    ctx.fillStyle = 'rgba(205,232,248,0.75)';
+    eachTile(scroll, (ox) => {
+      for (const b of layer) {
+        const bx = ox + b.x;
+        if (bx > W || bx + b.w < 0) continue;
+        const bh = b.h * S;
+        const cols = Math.max(1, Math.floor(b.w / 9));
+        const rows = Math.floor(bh / 12) - 1;
+        for (let rr = 0; rr < rows; rr++) {
+          for (let cc = 0; cc < cols; cc++) {
+            if (((b.id * 31 + rr * 17 + cc * 7) % 5) === 0) {
+              ctx.fillRect(bx + 4 + cc * 9, GY - bh + 6 + rr * 12, 3, 4);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  function drawGround(sN) {
+    ctx.fillStyle = '#4B5159';
+    ctx.fillRect(0, GY, W, H - GY);
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillRect(0, GY, W, 1.5);
+    const sp = 46 * S;
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    for (let x = -(sN % sp); x < W; x += sp) ctx.fillRect(x, GY + 7 * S, 18 * S, 2 * S);
+  }
+
+  function drawPad(sN, now) {
+    const px = x0() + 22 * S - sN;
+    if (px < -90 * S) return;
+    const w = 62 * S, top = GY - 6 * S;
+    ctx.fillStyle = '#8D959F';
+    ctx.fillRect(px - w, top, w * 2, 6 * S);
+    ctx.fillStyle = '#F2C230';
+    ctx.fillRect(px - w, top, w * 2, 1.8);
+    const blink = (Math.floor(now / 500) % 2) ? 1 : 0.35;
+    ctx.fillStyle = `rgba(230,60,50,${blink})`;
+    dot(px - w + 4, top + 3 * S, 1.8);
+    dot(px + w - 4, top + 3 * S, 1.8);
+  }
+
+  function drawDust(cx, now, k) {
+    ctx.fillStyle = `rgba(150,160,170,${0.16 * k})`;
+    for (let i = 0; i < 6; i++) {
+      const ph = (now / 520 + i * 0.31) % 1;
+      const dir = i % 2 ? 1 : -1;
+      ctx.beginPath();
+      ctx.ellipse(cx + dir * (20 + ph * 70) * S, GY - 3 * S, (12 + ph * 18) * S, (2.5 + ph * 3) * S, 0, 0, TWO_PI);
+      ctx.fill();
+    }
+  }
+
+  function drawTrail(e, stroke, fillTop) {
+    if (e <= 0) return;
+    const n = 56;
+    const first = pos(0);
+    let p = first;
+    ctx.beginPath();
+    ctx.moveTo(first.x, first.y);
+    for (let i = 1; i <= n; i++) {
+      p = pos((e * i) / n);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+    ctx.lineTo(p.x, GY);
+    ctx.lineTo(first.x, GY);
+    ctx.closePath();
+    const g = ctx.createLinearGradient(0, p.y, 0, GY);
+    g.addColorStop(0, fillTop);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.fill();
+  }
+
+  // ---------- hélicoptère militaire (vue de côté, nez vers la droite) ----------
+  function bodyPath() {
+    ctx.beginPath();
+    ctx.moveTo(66, 7);
+    ctx.quadraticCurveTo(67, -2, 52, -6);
+    ctx.lineTo(34, -12);
+    ctx.lineTo(20, -14);
+    ctx.lineTo(-10, -17);
+    ctx.lineTo(-40, -10);
+    ctx.lineTo(-92, -8);
+    ctx.lineTo(-92, -3);
+    ctx.lineTo(-40, 6);
+    ctx.lineTo(-10, 14);
+    ctx.lineTo(40, 14);
+    ctx.quadraticCurveTo(62, 14, 66, 7);
+    ctx.closePath();
+  }
+
+  function poly(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+  }
+
+  function patch(cx, cy, rx, ry, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, TWO_PI);
+    ctx.fill();
+  }
+
+  function drawHeli(x, y, angle, s, phase, now) {
+    const P = (pts) => {
+      ctx.beginPath();
+      pts.forEach((q, i) => (i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1])));
+      ctx.closePath();
+    };
+    const body = () => {
+      ctx.beginPath();
+      ctx.moveTo(76, 6);
+      ctx.bezierCurveTo(74, -1, 66, -7, 54, -10);
+      ctx.lineTo(36, -12);
+      ctx.bezierCurveTo(28, -13, 22, -19, 10, -20);
+      ctx.bezierCurveTo(-2, -21, -12, -18, -22, -14);
+      ctx.lineTo(-88, -8);
+      ctx.lineTo(-96, -8);
+      ctx.lineTo(-96, -2);
+      ctx.lineTo(-86, -1);
+      ctx.lineTo(-28, 4);
+      ctx.bezierCurveTo(-20, 10, -10, 13, 4, 13);
+      ctx.lineTo(50, 13);
+      ctx.bezierCurveTo(64, 13, 74, 11, 76, 6);
+      ctx.closePath();
+    };
+    const OUT = '#1B2013';
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+    ctx.scale(s, s);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // train : jambes + roues
+    ctx.strokeStyle = '#2A2E34'; ctx.lineWidth = 3.4;
+    ctx.beginPath(); ctx.moveTo(-6, 11); ctx.lineTo(-6, 24); ctx.moveTo(51, 12); ctx.lineTo(52, 22); ctx.stroke();
+    for (const [wx, wy, wr] of [[-6, 25, 4.4], [52, 23.5, 3.4]]) {
+      ctx.fillStyle = '#16181C'; dot(wx, wy, wr);
+      ctx.fillStyle = '#B9C0CB'; dot(wx, wy, wr * 0.42);
+      ctx.fillStyle = '#5A606A'; dot(wx, wy, wr * 0.18);
+    }
+
+    // pylône + pod de roquettes
+    ctx.strokeStyle = '#2E3228'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(14, 11); ctx.lineTo(14, 16); ctx.stroke();
+    const pg = ctx.createLinearGradient(0, 15, 0, 22);
+    pg.addColorStop(0, '#7A826C'); pg.addColorStop(1, '#2B3022');
+    ctx.fillStyle = pg; ctx.fillRect(4, 15, 34, 7);
+    ctx.strokeStyle = OUT; ctx.lineWidth = 1; ctx.strokeRect(4, 15, 34, 7);
+    ctx.fillStyle = '#10130C';
+    for (let i = 0; i < 3; i++) dot(37, 16.8 + i * 2, 1);
+
+    // canon
+    ctx.fillStyle = '#4A5040';
+    ctx.beginPath(); ctx.ellipse(60, 12, 7, 4, 0, 0, TWO_PI); ctx.fill();
+    ctx.strokeStyle = OUT; ctx.lineWidth = 1; ctx.stroke();
+    ctx.strokeStyle = '#1B1E15'; ctx.lineWidth = 2.6;
+    ctx.beginPath(); ctx.moveTo(62, 13); ctx.lineTo(82, 15.5); ctx.stroke();
+
+    // fuselage
+    const bg = ctx.createLinearGradient(0, -21, 0, 13);
+    bg.addColorStop(0, '#9DAF6C');
+    bg.addColorStop(0.45, '#6F8244');
+    bg.addColorStop(1, '#38462A');
+    body(); ctx.fillStyle = bg; ctx.fill();
+    ctx.save();
+    body(); ctx.clip();
+    patch(10, -6, 26, 6, 'rgba(52,66,30,0.55)');
+    patch(-52, -3, 28, 3.5, 'rgba(52,66,30,0.55)');
+    patch(52, 5, 14, 5, 'rgba(52,66,30,0.5)');
+    patch(-20, 3, 18, 5, 'rgba(170,150,92,0.45)');
+    patch(30, -11, 11, 4, 'rgba(170,150,92,0.4)');
+    const hl = ctx.createLinearGradient(0, -21, 0, -4);
+    hl.addColorStop(0, 'rgba(255,255,255,0.38)'); hl.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = hl; ctx.fillRect(-100, -22, 190, 18);
+    const sh = ctx.createLinearGradient(0, 2, 0, 13);
+    sh.addColorStop(0, 'rgba(0,0,0,0)'); sh.addColorStop(1, 'rgba(0,0,0,0.42)');
+    ctx.fillStyle = sh; ctx.fillRect(-100, 2, 190, 12);
+    ctx.strokeStyle = 'rgba(0,0,0,0.28)'; ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(-4, -19); ctx.lineTo(-4, 13);
+    ctx.moveTo(26, -13); ctx.lineTo(26, 13);
+    ctx.stroke();
+    ctx.restore();
+    body(); ctx.strokeStyle = OUT; ctx.lineWidth = 1.3; ctx.stroke();
+
+    // nacelle moteur
+    const ng = ctx.createLinearGradient(0, -27, 0, -13);
+    ng.addColorStop(0, '#93A667'); ng.addColorStop(1, '#3A482A');
+    ctx.fillStyle = ng;
+    ctx.beginPath(); ctx.ellipse(-12, -20, 21, 7, 0, 0, TWO_PI); ctx.fill();
+    ctx.strokeStyle = OUT; ctx.lineWidth = 1.1; ctx.stroke();
+    ctx.fillStyle = '#12150D';
+    ctx.beginPath(); ctx.ellipse(8, -20, 3.4, 5.2, 0, 0, TWO_PI); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(-31, -20, 3.2, 3.4, 0, 0, TWO_PI); ctx.fill();
+
+    // verrières
+    const gl = ctx.createLinearGradient(0, -19, 0, 5);
+    gl.addColorStop(0, '#CFEFF7');
+    gl.addColorStop(0.5, '#6FB0C6');
+    gl.addColorStop(1, '#27546A');
+    const cf = [[68, 4], [61, -3], [49, -8], [36, -11], [34, 0], [53, 3]];
+    const cr = [[30, -12], [22, -19], [8, -19], [4, -4], [30, -2]];
+    ctx.fillStyle = gl; P(cf); ctx.fill(); P(cr); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.45)';
+    P([[60, 0], [55, -4], [45, -7], [41, -6], [47, 0]]); ctx.fill();
+    P([[24, -16], [14, -16], [11, -9], [21, -9]]); ctx.fill();
+    ctx.strokeStyle = OUT; ctx.lineWidth = 1.5;
+    P(cf); ctx.stroke(); P(cr); ctx.stroke();
+
+    // cocarde + immatriculation
+    ctx.fillStyle = '#1FA34A'; dot(-34, -4, 6.6);
+    ctx.fillStyle = '#F2C230'; dot(-34, -4, 4.5);
+    ctx.fillStyle = '#D2342B'; dot(-34, -4, 2.3);
+    ctx.fillStyle = 'rgba(245,247,250,0.95)';
+    ctx.font = '700 6.5px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('223', -66, -3);
+
+    // stabilisateur + dérive
+    ctx.fillStyle = '#4E5E31'; ctx.fillRect(-94, -9, 16, 3);
+    const fin = [[-80, -8], [-92, -32], [-79, -32], [-66, -8]];
+    ctx.save(); P(fin); ctx.clip();
+    ctx.fillStyle = '#1FA34A'; ctx.fillRect(-94, -34, 10, 30);
+    ctx.fillStyle = '#F2C230'; ctx.fillRect(-84, -34, 9, 30);
+    ctx.fillStyle = '#D2342B'; ctx.fillRect(-75, -34, 10, 30);
+    const f2 = ctx.createLinearGradient(-94, 0, -66, 0);
+    f2.addColorStop(0, 'rgba(255,255,255,0.2)'); f2.addColorStop(1, 'rgba(0,0,0,0.25)');
+    ctx.fillStyle = f2; ctx.fillRect(-94, -34, 30, 30);
+    ctx.restore();
+    P(fin); ctx.strokeStyle = OUT; ctx.lineWidth = 1; ctx.stroke();
+
+    // feu anticollision
+    const on = Math.floor(now / 450) % 2;
+    if (on) { ctx.fillStyle = 'rgba(255,70,60,0.3)'; dot(-86, -33, 5); }
+    ctx.fillStyle = on ? '#FF463C' : 'rgba(255,70,60,0.3)'; dot(-86, -33, 2);
+
+    // rotor anticouple
+    ctx.save();
+    ctx.translate(-91, -22);
+    ctx.fillStyle = 'rgba(40,50,60,0.12)'; dot(0, 0, 11);
+    const a = phase * 1.4;
+    ctx.strokeStyle = 'rgba(40,46,54,0.75)'; ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    for (let k = 0; k < 2; k++) {
+      const aa = a + k * Math.PI / 2;
+      ctx.moveTo(Math.cos(aa) * 11, Math.sin(aa) * 11); ctx.lineTo(-Math.cos(aa) * 11, -Math.sin(aa) * 11);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#14171D'; dot(0, 0, 2.4);
+    ctx.restore();
+
+    // mât + rotor principal
+    const mg = ctx.createLinearGradient(3, 0, 9, 0);
+    mg.addColorStop(0, '#4A5238'); mg.addColorStop(0.5, '#9AA28A'); mg.addColorStop(1, '#2A3320');
+    ctx.fillStyle = mg; ctx.fillRect(3, -31, 6, 12);
+    const L = 78, hx = 6, hy = -31;
+    ctx.fillStyle = 'rgba(40,50,60,0.07)';
+    ctx.beginPath(); ctx.ellipse(hx, hy, L, 4.8, 0, 0, TWO_PI); ctx.fill();
+    ctx.fillStyle = 'rgba(40,50,60,0.06)';
+    ctx.beginPath(); ctx.ellipse(hx, hy, L * 0.55, 3.2, 0, 0, TWO_PI); ctx.fill();
+    ctx.lineWidth = 2.8;
+    for (let k = 0; k < 5; k++) {
+      const ang = phase + (k * TWO_PI) / 5;
+      const ex = hx + Math.cos(ang) * L, ey = hy + Math.sin(ang) * 3.2;
+      const bgr = ctx.createLinearGradient(hx, hy, ex, ey);
+      bgr.addColorStop(0, 'rgba(30,32,28,0.95)');
+      bgr.addColorStop(0.82, 'rgba(55,60,56,0.85)');
+      bgr.addColorStop(0.84, 'rgba(240,200,50,0.95)');
+      bgr.addColorStop(1, 'rgba(240,200,50,0.95)');
+      ctx.strokeStyle = bgr;
+      ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(ex, ey); ctx.stroke();
+    }
+    const hg = ctx.createRadialGradient(hx - 1.5, hy - 1.5, 0, hx, hy, 5);
+    hg.addColorStop(0, '#9AA2B0'); hg.addColorStop(1, '#14171D');
+    ctx.fillStyle = hg; dot(hx, hy, 4.8);
+
+    ctx.restore();
+  }
+
+  // ---------- explosion au crash ----------
+  let crashFx = null;
+
+  function startCrashFx(e) {
+    const p = (lastDraw && mode === 'flying') ? lastDraw : pos(e);
+    const fx = { ts: performance.now(), x: p.x, y: p.y, tilt: smoothTilt, parts: [], debris: [], smoke: [], smokeAcc: 0 };
+    for (let i = 0; i < 42; i++) {
+      const a = Math.random() * TWO_PI;
+      const sp = (60 + Math.random() * 280) * S;
+      fx.parts.push({
+        x: p.x, y: p.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 50,
+        life: 0, max: 500 + Math.random() * 800, r: (2 + Math.random() * 4) * S, hue: Math.random(),
+      });
+    }
+    ['blade', 'blade', 'blade', 'tail', 'body', 'pod'].forEach((kind) => {
+      fx.debris.push({
+        kind, x: p.x, y: p.y,
+        vx: (Math.random() - 0.5) * 300 * S, vy: -(80 + Math.random() * 240) * S,
+        rot: Math.random() * TWO_PI, vr: (Math.random() - 0.5) * 16,
+      });
+    });
+    crashFx = fx;
+  }
+
+  function drawDebris(d, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(d.x, d.y);
+    ctx.rotate(d.rot);
+    ctx.scale(S, S);
+    if (d.kind === 'blade') {
+      ctx.fillStyle = '#CDD2DA';
+      ctx.fillRect(-30, -2, 60, 4);
+    } else if (d.kind === 'tail') {
+      ctx.fillStyle = '#4F5C30';
+      ctx.beginPath();
+      ctx.moveTo(-34, -4); ctx.lineTo(34, -6); ctx.lineTo(34, 0); ctx.lineTo(-34, 5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#1FA34A'; ctx.fillRect(-34, -16, 6, 11);
+      ctx.fillStyle = '#F2C230'; ctx.fillRect(-28, -16, 6, 11);
+      ctx.fillStyle = '#D2342B'; ctx.fillRect(-22, -16, 6, 11);
+    } else if (d.kind === 'body') {
+      ctx.fillStyle = '#5B6B3A';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 24, 12, 0, 0, TWO_PI);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(120,200,205,0.9)';
+      ctx.beginPath();
+      ctx.ellipse(10, -3, 9, 6, 0, 0, TWO_PI);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = '#3A3F36';
+      ctx.fillRect(-17, -3.5, 34, 7);
+    }
+    ctx.restore();
+  }
+
+  function renderCrash(now, dt) {
+    const f = crashFx;
+    if (!f) return;
+    const age = now - f.ts;
+
+    // flash blanc à l'impact
+    if (age < 170) {
+      ctx.fillStyle = 'rgba(255,255,255,' + (0.6 * (1 - age / 170)) + ')';
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // hélico touché : il tremble, s'incline et clignote en orange
+    if (age < 180) {
+      const j = 3 * S;
+      drawHeli(f.x + (Math.random() - 0.5) * j, f.y + (Math.random() - 0.5) * j,
+               f.tilt + (age / 180) * 0.45, S, rotorPhase, now);
+      if (Math.floor(age / 45) % 2 === 0) {
+        ctx.fillStyle = 'rgba(255,120,40,0.38)';
+        dot(f.x, f.y, 36 * S);
+      }
+    }
+
+    // boule de feu (lisible de jour : cœur clair, bord rouge sombre)
+    if (age < 800) {
+      const k = age / 800;
+      const rad = (26 + 92 * Math.sqrt(k)) * S;
+      const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, rad);
+      g.addColorStop(0, 'rgba(255,252,230,' + (1 - k * 0.6) + ')');
+      g.addColorStop(0.3, 'rgba(255,205,70,' + (0.95 * (1 - k)) + ')');
+      g.addColorStop(0.62, 'rgba(240,100,30,' + (0.85 * (1 - k)) + ')');
+      g.addColorStop(0.9, 'rgba(120,28,10,' + (0.55 * (1 - k)) + ')');
+      g.addColorStop(1, 'rgba(120,28,10,0)');
+      ctx.fillStyle = g;
+      dot(f.x, f.y, rad);
+    }
+
+    // onde de choc
+    if (age < 650) {
+      const k = age / 650;
+      ctx.strokeStyle = 'rgba(255,255,255,' + (0.85 * (1 - k)) + ')';
+      ctx.lineWidth = 4 * (1 - k) + 0.6;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, (10 + 190 * k) * S, 0, TWO_PI);
+      ctx.stroke();
+    }
+
+    // fumée noire
+    if (age < 2200) {
+      f.smokeAcc += dt;
+      while (f.smokeAcc > 0.04) {
+        f.smokeAcc -= 0.04;
+        f.smoke.push({
+          x: f.x + (Math.random() - 0.5) * 34 * S, y: f.y + (Math.random() - 0.5) * 14 * S,
+          vx: (Math.random() - 0.5) * 26, vy: -(22 + Math.random() * 36),
+          life: 0, max: 1300 + Math.random() * 800, r: (9 + Math.random() * 9) * S,
+        });
+      }
+    }
+    f.smoke = f.smoke.filter((p) => p.life < p.max);
+    for (const p of f.smoke) {
+      p.life += dt * 1000;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      const k = Math.min(1, p.life / p.max);
+      ctx.fillStyle = 'rgba(28,30,36,' + (0.6 * (1 - k)) + ')';
+      dot(p.x, p.y, p.r * (1 + k * 1.7));
+    }
+
+    // étincelles
+    f.parts = f.parts.filter((p) => p.life < p.max);
+    for (const p of f.parts) {
+      p.life += dt * 1000;
+      p.vy += 700 * S * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      const k = Math.min(1, p.life / p.max);
+      ctx.fillStyle = 'hsla(' + (12 + p.hue * 40) + ',100%,' + (52 + p.hue * 18) + '%,' + (1 - k) + ')';
+      dot(p.x, p.y, p.r * (1 - k * 0.5));
+    }
+
+    // débris : chute, rebond, immobilisation au sol, puis estompage
+    const G = 1100 * S;
+    let allLanded = true;
+    for (const d of f.debris) {
+      if (!d.landed) {
+        d.vy += G * dt;
+        d.x += d.vx * dt; d.y += d.vy * dt;
+        d.rot += d.vr * dt;
+        if (d.y > GY - 3) {
+          d.y = GY - 3;
+          d.vy *= -0.25; d.vx *= 0.7; d.vr *= 0.6;
+          if (Math.abs(d.vy) < 40 * S) { d.vy = 0; d.vx = 0; d.vr = 0; d.landed = true; }
+        }
+      }
+      if (!d.landed) allLanded = false;
+    }
+    if (allLanded && !f.landedTs) f.landedTs = now;
+    let fade = 1;
+    if (f.landedTs) fade = Math.max(0, 1 - (now - f.landedTs - 1500) / 900);
+    else if (age > 7000) fade = Math.max(0, 1 - (age - 7000) / 900);
+    if (fade > 0) for (const d of f.debris) drawDebris(d, fade);
+  }
+
+  let mode = 'idle';              // 'idle' | 'flying' | 'crashed'
+  let roundStartTs = null;
+  let crashElapsed = 0;
+  let lastE = 0;
+  let rotorPhase = 0;
+  let lastDraw = null;
+  let smoothTilt = 0.08;
+  let lastFrame = performance.now();
+
+  function render(now, dt) {
+    if (!W || !H) return;
+    ctx.clearRect(0, 0, W, H);
+
+    let e = 0;
+    if (mode === 'flying' && roundStartTs) e = Math.max(0, now - roundStartTs);
+    else if (mode === 'crashed') e = crashElapsed;
+    lastE = e;
+
+    const p = pos(e);
+    const r = p.r;
+
+    drawSky(r);
+    drawMoon(r);
+    drawStars(e * 0.006, r, now);
+    drawClouds(e * 0.025, r);
+    drawSkyline(SKY_FAR, e * 0.02, '#A9BDD0', false);
+    drawSkyline(SKY_MID, e * 0.04, '#8AA3BB', true);
+    drawGround(e * 0.09);
+    drawPad(e * 0.09, now);
+
+    if (mode === 'crashed') {
+      drawTrail(e, '#C2493D', 'rgba(194,73,61,0.22)');
+      renderCrash(now, dt);
+    } else {
+      if (e > 0) drawTrail(e, '#D4A54A', 'rgba(79,184,174,0.20)');
+      rotorPhase += dt * (mode === 'flying' ? 46 : 16);
+      let tiltT = 0.06, bob = 0, hx = p.x, hy = p.y;
+      if (mode === 'flying' && e > 0) {
+        const q = pos(Math.max(0, e - 200));
+        const path = Math.atan2(p.y - q.y, Math.max(p.x - q.x, 0.01));
+        tiltT = 0.04 + Math.max(0, Math.min(1, (p.x - q.x) / (20 * S))) * 0.16;
+        bob = Math.sin(now / 380) * 2.2 * S * (0.25 + r);
+      } else {
+        hx += (Math.random() - 0.5) * 0.7;
+        hy += Math.sin(now / 45) * 0.5;
+      }
+      smoothTilt += (tiltT - smoothTilt) * Math.min(1, dt * 6);
+      const near = Math.max(0, 1 - (y0() - hy) / (70 * S));
+      if (near > 0.02) drawDust(hx + 22 * S, now, near);
+      lastDraw = (mode === 'flying' && e > 0) ? { x: hx, y: hy + bob, tilt: smoothTilt } : null;
+      drawHeli(hx, hy + bob, smoothTilt, S, rotorPhase, now);
+    }
+  }
+
+  function frame() {
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - lastFrame) / 1000);
+    lastFrame = now;
+    render(now, dt);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  /* ===================== UI / LOGIQUE (inchangée) ===================== */
+
+  function pushHistory(crashPoint) {
+    const el = document.createElement('div');
+    el.className = 'entry ' + (crashPoint < 1.5 ? 'low' : crashPoint < 5 ? 'mid' : 'high');
+    el.textContent = crashPoint.toFixed(2) + 'x';
+    historyEl.prepend(el);
+    while (historyEl.children.length > 30) historyEl.lastChild.remove();
+  }
+
+  const bets = initBets({ socket, panelsEl });
+  // --- diagnostic connexion : actif seulement avec ?dbg=1 ---
+  if (new URLSearchParams(location.search).has('dbg')) {
+    const dbg = document.createElement('div');
+    dbg.style.cssText = 'position:fixed;left:4px;top:44px;z-index:60;font:10px monospace;color:#9f9;background:rgba(0,0,0,.65);padding:3px 5px;pointer-events:none;max-width:80vw;white-space:pre';
+    document.body.appendChild(dbg);
+    const dlog = []; let lastMsg = performance.now(); let nMsg = 0;
+    const dpush = (m) => { dlog.push(new Date().toISOString().slice(11, 19) + ' ' + m); while (dlog.length > 8) dlog.shift(); dbg.textContent = dlog.join('\n'); try { localStorage.setItem('223.dbg', JSON.stringify(dlog)); } catch (_) {} };
+    socket.addEventListener('broadcast', () => { lastMsg = performance.now(); nMsg++; });
+    socket.addEventListener('status', (e) => dpush(e.detail.state + ' silence=' + Math.round(performance.now() - lastMsg) + 'ms msgs=' + nMsg + ' hidden=' + document.hidden + ' online=' + navigator.onLine));
+  }
+
+  function setPanelsInteractive(enabled) { bets.setInteractive(enabled); }
+  setPanelsInteractive(false); // état initial : pas encore connecté
+  // Stubs : la logique des panneaux vit dans bets.js (appels résiduels sans effet).
+  function setPanelPending() {}
+  function setPanelActive() {}
+
+  socket.addEventListener('status', (e) => {
+    statusEl.dataset.state = e.detail.state;
+    const connected = e.detail.state === 'connected';
+    setPanelsInteractive(connected);
+    if (!connected) {
+      roundStateEl.textContent =
+        e.detail.state === 'reconnecting' ? 'reconnexion...' :
+        e.detail.state === 'replaced' ? 'session ouverte ailleurs' :
+        e.detail.state === 'stale' ? 'connexion instable...' :
+        'déconnecté';
+    }
+  });
+
+  socket.addEventListener('balance', (e) => {
+    /* affichage du solde géré par bets.js (débit/crédit optimistes) */
+  });
+
+  socket.addEventListener('serverError', (e) => {
+    roundStateEl.textContent = e.detail.reason || 'erreur';
+  });
+
+  socket.addEventListener('sendFailed', () => {
+    roundStateEl.textContent = 'action non envoyée — hors ligne';
+  });
+
+  socket.addEventListener('actionTimeout', (e) => {
+    const panel = document.querySelector(`.bet-panel[data-slot="${e.detail.slot}"]`);
+    if (panel) setPanelPending(panel, false);
+    roundStateEl.textContent = 'pas de réponse serveur — réessaie';
+  });
+
+  socket.addEventListener('broadcast', (e) => {
+    const { type, data } = e.detail;
+    if (type === 'ROUND_START') {
+      roundIdEl.textContent = data.roundId ?? '';
+      heli.stop();
+      roundStateEl.textContent = 'mises ouvertes';
+      multEl.textContent = '1.00x';
+      multEl.classList.remove('crashed');
+      zoneEl.classList.remove('crashed');
+      roundStartTs = null;
+      mode = 'idle';
+      crashFx = null;
+      document.querySelectorAll('.bet-panel').forEach((pn) => setPanelActive(pn, false));
+    } else if (type === 'TICK') {
+      // Resynchronisé à CHAQUE tick (pas juste au premier) pour que la scène
+      // ne dérive jamais du multiplicateur serveur, qui reste la seule source de vérité.
+      roundStartTs = performance.now() - (data.elapsedMs || 0);
+      mode = 'flying';
+      roundStateEl.textContent = 'en vol';
+      multEl.textContent = Number(data.multiplier).toFixed(2) + 'x';
+      heli.start();
+      heli.setMultiplier(Number(data.multiplier));
+    } else if (type === 'CRASH') {
+      roundStateEl.textContent = 'crashé';
+      multEl.textContent = Number(data.crashPoint).toFixed(2) + 'x';
+      multEl.classList.add('crashed');
+      zoneEl.classList.add('crashed');
+      pushHistory(data.crashPoint);
+      heli.crash();
+      // L'hélico explose exactement au crashPoint (inverse de la formule engine).
+      const cp = Number(data.crashPoint);
+      crashElapsed = Number.isFinite(cp) ? (cp > 1 ? Math.log(cp) / 0.00006 : 0) : lastE;
+      startCrashFx(crashElapsed);
+      mode = 'crashed';
+      roundStartTs = null;
+    }
+  });
+
+  socket.connect();
+}
+</script>
+</body>
+</html>

@@ -74,6 +74,52 @@ func TestTwoBetPanelsSameUserSameRound(t *testing.T) {
 	}
 }
 
+func TestFourBetPanelsSameUserSameRound(t *testing.T) {
+	manager := NewBetManager()
+
+	if err := manager.OpenRound("round-1"); err != nil {
+		t.Fatalf("OpenRound: %v", err)
+	}
+
+	panels := []BetPanel{Panel1, Panel2, Panel3, Panel4}
+	seenIDs := make(map[string]bool, len(panels))
+
+	for _, panel := range panels {
+		bet, err := manager.PlaceBet(
+			"user-1",
+			panel,
+			1000,
+			2.00,
+		)
+		if err != nil {
+			t.Fatalf("%s doit être accepté: %v", panel.String(), err)
+		}
+
+		if bet.Panel != panel {
+			t.Fatalf("panel incorrect: attendu %v, reçu %v", panel, bet.Panel)
+		}
+
+		if seenIDs[bet.ID] {
+			t.Fatalf("bet ID dupliqué entre panels: %s", bet.ID)
+		}
+		seenIDs[bet.ID] = true
+	}
+
+	// Un 5e pari sur un panel déjà occupé (Panel1) doit être refusé.
+	_, err := manager.PlaceBet(
+		"user-1",
+		Panel1,
+		1000,
+		2.00,
+	)
+	if !errors.Is(err, ErrBetAlreadyExists) {
+		t.Fatalf(
+			"un deuxième pari sur Panel1 doit être refusé, erreur reçue: %v",
+			err,
+		)
+	}
+}
+
 func TestTwoPanelsCashoutIndependently(t *testing.T) {
 	manager := NewBetManager()
 
@@ -171,18 +217,23 @@ func TestInvalidPanel(t *testing.T) {
 		t.Fatalf("OpenRound: %v", err)
 	}
 
-	_, err := manager.PlaceBet(
-		"user-1",
-		BetPanel(3),
-		1000,
-		2.00,
-	)
-
-	if !errors.Is(err, ErrInvalidPanel) {
-		t.Fatalf(
-			"panel 3 doit être refusé, erreur reçue: %v",
-			err,
+	// Panel3 et Panel4 sont désormais valides (MaxBetPanels=4).
+	// Seuls 0 et 5+ doivent être refusés.
+	for _, invalid := range []BetPanel{BetPanel(0), BetPanel(5)} {
+		_, err := manager.PlaceBet(
+			"user-1",
+			invalid,
+			1000,
+			2.00,
 		)
+
+		if !errors.Is(err, ErrInvalidPanel) {
+			t.Fatalf(
+				"panel %d doit être refusé, erreur reçue: %v",
+				invalid,
+				err,
+			)
+		}
 	}
 }
 

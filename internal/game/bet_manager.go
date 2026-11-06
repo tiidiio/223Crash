@@ -36,10 +36,14 @@ type BetPanel uint8
 const (
 	Panel1 BetPanel = 1
 	Panel2 BetPanel = 2
+	Panel3 BetPanel = 3
+	Panel4 BetPanel = 4
 )
 
+const MaxBetPanels = 4
+
 func (p BetPanel) IsValid() bool {
-	return p == Panel1 || p == Panel2
+	return p == Panel1 || p == Panel2 || p == Panel3 || p == Panel4
 }
 
 func (p BetPanel) String() string {
@@ -48,6 +52,10 @@ func (p BetPanel) String() string {
 		return "PANEL_1"
 	case Panel2:
 		return "PANEL_2"
+	case Panel3:
+		return "PANEL_3"
+	case Panel4:
+		return "PANEL_4"
 	default:
 		return "UNKNOWN"
 	}
@@ -214,13 +222,6 @@ func (bm *BetManager) PlaceBet(
 	return cloneBet(bet), nil
 }
 
-// Cashout reçoit UNIQUEMENT le bet ID et le multiplicateur
-// fourni par le moteur autoritaire.
-//
-// Le client ne doit jamais fournir currentMultiplier directement.
-//
-// Le CrashEngine appelle cette méthode avec son propre
-// multiplicateur courant.
 func (bm *BetManager) Cashout(
 	betID string,
 	currentMultiplier float64,
@@ -492,7 +493,7 @@ func isValidMultiplier(multiplier float64) bool {
 }
 
 func normalizeMultiplier(multiplier float64) float64 {
-	return math.Floor(multiplier*100) / 100
+	return math.Floor(multiplier*100+1e-7) / 100 // +1e-7 : absorbe 1.15*100=114.99999999999999 (idempotence)
 }
 
 func cloneBet(bet *Bet) *Bet {

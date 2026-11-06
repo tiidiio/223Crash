@@ -2,124 +2,95 @@ package engine
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
-	"errors"
+	"fmt"
 	"math"
 	"strconv"
 )
 
-const DefaultHouseEdge = 0.01
+// HouseEdgePercent définit le RTP cible (97%) utilisé dans le calcul du crash point
+// (nom historique : la valeur est le RTP, pas la marge).
+const HouseEdgePercent = 97.0
 
-var (
-	ErrInvalidServerSeed = errors.New("server seed is empty")
-	ErrInvalidClientSeed = errors.New("client seed is empty")
-	ErrInvalidNonce      = errors.New("nonce must be >= 0")
-	ErrInvalidCrashPoint = errors.New("invalid crash point")
-	ErrInvalidHouseEdge  = errors.New("house edge must be >= 0 and < 1")
-)
+// MaxCrashPoint est le multiplicateur de crash maximal d'un round. Il borne l'exposition
+// de l'opérateur par round. Pour toute cible de cashout t <= MaxCrashPoint, le RTP reste
+// celui de HouseEdgePercent : P(crash >= t) = 0.97/t n'est pas modifié par le plafond.
+const MaxCrashPoint = 5000.0
 
-// CrashPoint génère un multiplicateur de crash déterministe.
-//
-// Le serveur utilise le serverSeed comme clé HMAC.
-// Le clientSeed et le nonce constituent le message.
-//
-// Formule :
-//
-//	u = HMAC-SHA256(serverSeed, clientSeed:nonce)
-//	r = valeur uniforme dans ]0,1]
-//	crash = floor(((1-houseEdge) / r) * 100) / 100
-//
-// Le résultat minimum est 1.00x.
-func CrashPoint(serverSeed, clientSeed string, nonce uint64, houseEdge float64) (float64, error) {
-	if serverSeed == "" {
-		return 0, ErrInvalidServerSeed
+// verifyTolerance absorbe les erreurs d'arrondi flottant lors de la ré-vérification
+// publique d'un crash point (valeur ayant transité par JSON/Mongo côté client).
+const verifyTolerance = 1e-9
+
+// GenerateServerSeed génère un server seed cryptographiquement sûr (32 octets, hex).
+func GenerateServerSeed() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("engine: generate server seed: %w", err)
 	}
+	return hex.EncodeToString(b), nil
+}
 
-	if clientSeed == "" {
-		return 0, ErrInvalidClientSeed
+// HashServerSeed retourne le digest SHA-256 hex du server seed, publié avant le round (commit).
+func HashServerSeed(serverSeed string) string {
+	sum := sha256.Sum256([]byte(serverSeed))
+	return hex.EncodeToString(sum[:])
+}
+
+// NextClientSeed dérive le client seed du round N à partir du server seed révélé du round N-1.
+// Chaîne provably fair : clientSeed(N) = SHA-256(serverSeed révélé du round N-1).
+func NextClientSeed(prevRevealedServerSeed string) string {
+	sum := sha256.Sum256([]byte(prevRevealedServerSeed))
+	return hex.EncodeToString(sum[:])
+}
+
+// crashFromX convertit X ∈ [0, 1[ en multiplicateur de crash :
+//
+//	crash = min(MaxCrashPoint, max(1.00, floor(HouseEdgePercent / (1 - X)) / 100))
+//
+// X ne peut jamais valoir 1 (e est borné à 2^52 - 1), donc (1 - X) n'est jamais nul.
+// X proche de 0 produit un crash inférieur à 1.00, ramené au plancher 1.00x.
+func crashFromX(x float64) float64 {
+	crash := math.Floor(HouseEdgePercent/(1-x)) / 100.0
+	if crash < 1.00 {
+		crash = 1.00
 	}
-
-	if houseEdge < 0 || houseEdge >= 1 {
-		return 0, ErrInvalidHouseEdge
+	if crash > MaxCrashPoint {
+		crash = MaxCrashPoint
 	}
+	return crash
+}
 
-	message := clientSeed + ":" + strconv.FormatUint(nonce, 10)
-
+// CrashPoint calcule le multiplicateur de crash déterministe d'un round.
+//
+// h = HMAC-SHA256(serverSeed, "clientSeed:nonce"), tronqué aux 52 premiers bits
+// (13 caractères hex) en un entier e ∈ [0, 2^52 - 1], puis X = e / 2^52 ∈ [0, 1[.
+// Le crash point est ensuite calculé par crashFromX (plancher 1.00x, plafond MaxCrashPoint).
+func CrashPoint(serverSeed, clientSeed string, nonce int64) (float64, error) {
 	mac := hmac.New(sha256.New, []byte(serverSeed))
-	_, _ = mac.Write([]byte(message))
-
-	sum := mac.Sum(nil)
-
-	// Les 8 premiers octets deviennent un entier uint64.
-	value := binary.BigEndian.Uint64(sum[:8])
-
-	// Conversion déterministe vers ]0,1].
-	//
-	// +1 évite zéro.
-	r := (float64(value) + 1.0) / (float64(math.MaxUint64) + 1.0)
-
-	crash := (1.0 - houseEdge) / r
-
-	// Arrondi vers le bas au centième.
-	crash = math.Floor(crash*100.0) / 100.0
-
-	if crash < 1.0 {
-		crash = 1.0
+	if _, err := mac.Write([]byte(fmt.Sprintf("%s:%d", clientSeed, nonce))); err != nil {
+		return 0, fmt.Errorf("engine: hmac write: %w", err)
 	}
+	digest := mac.Sum(nil)
+	hexDigest := hex.EncodeToString(digest)
 
-	return crash, nil
-}
-
-// Verify recalcule le crash point et vérifie qu'il correspond.
-//
-// La comparaison utilise une tolérance extrêmement faible afin
-// d'éviter les problèmes de représentation floating-point.
-func Verify(serverSeed, clientSeed string, nonce uint64, crashPoint float64) bool {
-	calculated, err := CrashPoint(
-		serverSeed,
-		clientSeed,
-		nonce,
-		DefaultHouseEdge,
-	)
+	e, err := strconv.ParseUint(hexDigest[:13], 16, 64)
 	if err != nil {
-		return false
+		return 0, fmt.Errorf("engine: parse hmac prefix %q: %w", hexDigest[:13], err)
 	}
 
-	return math.Abs(calculated-crashPoint) < 0.0000001
+	const maxE = float64(uint64(1) << 52)
+	return crashFromX(float64(e) / maxE), nil
 }
 
-// VerifyWithHouseEdge permet de vérifier avec un house edge configurable.
-func VerifyWithHouseEdge(
-	serverSeed,
-	clientSeed string,
-	nonce uint64,
-	crashPoint float64,
-	houseEdge float64,
-) bool {
-	calculated, err := CrashPoint(
-		serverSeed,
-		clientSeed,
-		nonce,
-		houseEdge,
-	)
+// VerifyCrashPoint recalcule le crash point à partir du server seed révélé, pour l'audit
+// public (endpoint GET /verify/{roundId}). Compare avec tolérance flottante — une égalité
+// stricte produit des faux négatifs dès que expectedCrash a transité par JSON/Mongo.
+func VerifyCrashPoint(serverSeed, clientSeed string, nonce int64, expectedCrash float64) (bool, error) {
+	calculated, err := CrashPoint(serverSeed, clientSeed, nonce)
 	if err != nil {
-		return false
+		return false, err
 	}
-
-	return math.Abs(calculated-crashPoint) < 0.0000001
-}
-
-// HashServerSeed permet de publier un engagement cryptographique
-// du server seed AVANT le round.
-//
-// Le server seed lui-même doit rester secret jusqu'au reveal.
-func HashServerSeed(serverSeed string) (string, error) {
-	if serverSeed == "" {
-		return "", ErrInvalidServerSeed
-	}
-
-	hash := sha256.Sum256([]byte(serverSeed))
-	return hex.EncodeToString(hash[:]), nil
+	return math.Abs(calculated-expectedCrash) < verifyTolerance, nil
 }
