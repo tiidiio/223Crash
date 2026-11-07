@@ -1,9 +1,17 @@
 // bets.js — panneaux de mise 223CRASH
 // Bouton intelligent : MISER -> MISE PLACÉE -> ENCAISSER (gain + multiplicateur en direct)
 // + mise en file pour le tour suivant, auto-bet, auto-cashout, ½ / ×2 / MAX, persistance locale.
+//
+// Règles de cohérence financière côté affichage :
+//  - Le solde serveur (événement 'balance') est la seule source de vérité : il efface tout
+//    débit optimiste en cours (p.debited), ce qui évite un double remboursement.
+//  - Un 'actionTimeout' de type 'bet' ne rembourse JAMAIS localement : le serveur peut encore
+//    débiter et répondre. Le panneau passe en état « non confirmé » (p.unconfirmed) jusqu'à une
+//    réponse définitive, un nouveau round ou une reconnexion.
 
 const SLOTS = ['A', 'B'];
 const LS_KEY = '223crash.bets.v1';
+const SYNC_GRACE_MS = 200; // laisse arriver BET_ACCEPTED de la synchro avant tout auto-bet
 const fmt = (n) => Number(n).toFixed(2);
 const buzz = (p) => { try { navigator.vibrate && navigator.vibrate(p); } catch (_) {} };
 
@@ -40,7 +48,10 @@ const tpl = (slot, pf) => `
 </div>`;
 
 export function initBets({ socket, panelsEl }) {
-  const st = { phase: 'idle', mult: 1, balance: null, connected: false };
+  const st = {
+    phase: 'idle', mult: 1, balance: null, connected: false,
+    holdUntil: 0, holdValue: 0, roundSeq: 0,
+  };
   const prefs = loadPrefs();
 
   panelsEl.innerHTML = SLOTS.map((s) => tpl(s, prefs[s] || {})).join('');
@@ -58,6 +69,7 @@ export function initBets({ socket, panelsEl }) {
       resultEl: el.querySelector('.result'),
       stepBtns: [...el.querySelectorAll('[data-act],[data-add]')],
       active: false, pending: false, cashing: false, queued: false,
+      unconfirmed: false, crashFlashed: false, debited: 0,
       stake: 0, cashMult: null, flashTimer: null, key: '',
     };
   });
@@ -101,6 +113,7 @@ export function initBets({ socket, panelsEl }) {
         sub = `${fmt(p.stake * st.mult)} · ${st.mult.toFixed(2)}x`;
       } else { mode = 'placed'; main = 'MISE PLACÉE'; sub = fmt(p.stake); disabled = true; }
     }
+    else if (p.unconfirmed && st.phase === 'betting') { mode = 'bet'; main = 'RÉESSAYER'; sub = amt + auto; }
     else if (p.queued) { mode = 'queued'; main = 'EN ATTENTE'; sub = 'tap pour annuler'; }
     else if (st.phase === 'betting') { mode = 'bet'; main = 'MISER'; sub = amt + auto; }
     else { mode = 'next'; main = 'MISER'; sub = 'tour suivant · ' + amt + auto; }
@@ -117,7 +130,9 @@ export function initBets({ socket, panelsEl }) {
     p.el.dataset.queued = p.queued ? 'true' : 'false';
     p.el.dataset.pending = p.pending ? 'true' : 'false';
 
-    const lock = !c || p.active || p.pending;
+    // Champs verrouillés aussi tant que la mise est non confirmée : un retry doit repartir
+    // avec exactement les mêmes paramètres (le serveur compare montant, panel et auto-cashout).
+    const lock = !c || p.active || p.pending || p.unconfirmed;
     p.amountEl.disabled = lock;
     p.autoEl.disabled = lock;
     p.stepBtns.forEach((b) => { b.disabled = lock; });
@@ -150,7 +165,7 @@ export function initBets({ socket, panelsEl }) {
     if (st.balance == null) return;
     st.balance = Math.round((st.balance - stake) * 100) / 100;
     p.debited = stake;
-    if (Date.now() < (st.holdUntil || 0)) st.holdValue = Math.round((st.holdValue - stake) * 100) / 100;
+    if (Date.now() < st.holdUntil) st.holdValue = Math.round((st.holdValue - stake) * 100) / 100;
     showBalance();
     renderAll();
   }
@@ -163,10 +178,19 @@ export function initBets({ socket, panelsEl }) {
     p.debited = 0;
   }
 
+  // Redemande le solde réel au serveur (réponse : événement 'balance').
+  function resyncBalance() {
+    try { socket.join(); } catch (_) {}
+  }
+
   function placeBet(p, fromQueue) {
+    // Retry d'une mise sans réponse définitive : même betId côté ws.js, donc aucun second débit
+    // serveur. On ne re-débite pas non plus l'affichage et on ne contrôle pas le solde (il est
+    // déjà diminué du montant) : c'est le serveur qui tranche.
+    const retry = p.unconfirmed;
     const stake = Math.round(Number(p.amountEl.value) * 100) / 100;
     if (!(stake >= 1)) return fail(p, 'Mise min. 1', fromQueue);
-    if (st.balance != null && stake > st.balance + 1e-9) return fail(p, 'Solde insuffisant', fromQueue);
+    if (!retry && st.balance != null && stake > st.balance + 1e-9) return fail(p, 'Solde insuffisant', fromQueue);
     const raw = p.autoEl.value.trim();
     const auto = raw === '' ? null : Number(raw);
     if (auto !== null && !(auto >= 1.01)) return fail(p, 'Auto-cashout ≥ 1.01x', fromQueue);
@@ -175,7 +199,7 @@ export function initBets({ socket, panelsEl }) {
     p.cashing = false;
     setPending(p, true);
     const sent = socket.bet(p.slot, stake, auto);
-    if (sent) optimisticDebit(p, stake);
+    if (sent && !retry) optimisticDebit(p, stake);
     if (!sent) { setPending(p, false); return fail(p, 'Hors ligne', fromQueue); }
     return true;
   }
@@ -215,8 +239,10 @@ export function initBets({ socket, panelsEl }) {
   // ---- événements serveur ----
   socket.addEventListener('balance', (e) => {
     const b = Number(e.detail && e.detail.balance);
-    if (Number.isFinite(b) && Date.now() < (st.holdUntil || 0) && b < st.holdValue - 1e-9) return;
+    if (Number.isFinite(b) && Date.now() < st.holdUntil && b < st.holdValue - 1e-9) return;
     st.balance = Number.isFinite(b) ? b : null;
+    // Solde serveur = vérité : plus aucun débit optimiste à rembourser plus tard.
+    if (Number.isFinite(b)) panels.forEach((p) => { p.debited = 0; });
     showBalance();
     renderAll();
   });
@@ -224,11 +250,21 @@ export function initBets({ socket, panelsEl }) {
   socket.addEventListener('status', (e) => setInteractive(e.detail.state === 'connected'));
 
   socket.addEventListener('actionTimeout', (e) => {
-    const p = bySlot(e.detail && e.detail.slot);
+    const d = (e && e.detail) || {};
+    const p = bySlot(d.slot);
     if (!p) return;
-    setPending(p, false);
-    optimisticRefund(p);
-    flash(p, 'Pas de réponse serveur', 'lose');
+    // Lu avant setPending(false), qui remet p.cashing à false.
+    const action = d.action || (p.cashing ? 'cashout' : 'bet');
+    if (action === 'bet') {
+      // Pas de remboursement local : le serveur peut encore débiter puis répondre.
+      p.unconfirmed = true;
+      setPending(p, false);
+      flash(p, 'Confirmation en attente…', 'lose');
+    } else {
+      setPending(p, false);
+      flash(p, 'Encaissement non confirmé', 'lose');
+    }
+    resyncBalance();
   });
 
   socket.addEventListener('playerEvent', (e) => {
@@ -240,17 +276,28 @@ export function initBets({ socket, panelsEl }) {
 
     if (type === 'BET_ACCEPTED') {
       p.active = true;
+      p.unconfirmed = false;
       p.debited = 0;
+      // La synchro de reconnexion/rechargement fournit le montant réel de la mise.
+      const amt = Number(data && data.amount);
+      if (Number.isFinite(amt) && amt > 0) p.stake = amt;
       buzz(15);
     } else if (type === 'BET_REJECTED') {
       p.active = false;
+      p.unconfirmed = false;
       optimisticRefund(p);
       flash(p, (data && data.reason) || 'Mise refusée', 'lose');
       if (p.autoBetEl.checked) { p.autoBetEl.checked = false; persist(); }
       buzz(80);
     } else if (type === 'CASHOUT_ACCEPTED') {
-      const m = Number(data.multiplier ?? data.cashoutMultiplier ?? p.cashMult ?? st.mult);
-      const payout = Number(data.payout ?? data.win ?? data.winAmount ?? p.stake * m);
+      let payout = Number(data.payout ?? data.win ?? data.winAmount);
+      let m = Number(data.multiplier ?? data.cashoutMultiplier);
+      if (!Number.isFinite(payout)) {
+        if (!Number.isFinite(m)) m = Number(p.cashMult ?? st.mult);
+        payout = p.stake * m;
+      } else if (!Number.isFinite(m)) {
+        m = p.stake > 0 ? payout / p.stake : Number(p.cashMult ?? st.mult);
+      }
       if (Number.isFinite(payout) && payout > 0 && st.balance != null) {
         st.balance = Math.round((st.balance + payout) * 100) / 100;
         st.holdValue = st.balance;
@@ -259,11 +306,21 @@ export function initBets({ socket, panelsEl }) {
         renderAll();
       }
       p.active = false;
-      flash(p, `+${fmt(payout)} @ ${m.toFixed(2)}x`, 'win');
+      p.unconfirmed = false;
+      flash(p, `+${fmt(payout)} @ ${Number.isFinite(m) ? m.toFixed(2) : '?'}x`, 'win');
       buzz([30, 40, 30]);
     } else if (type === 'CASHOUT_REJECTED') {
-      p.active = false;
-      flash(p, 'Encaissement refusé', 'lose');
+      const reason = data && data.reason;
+      if (reason === 'round_crashed') {
+        if (!p.crashFlashed) { flash(p, `−${fmt(p.stake)} · crash`, 'lose'); p.crashFlashed = true; }
+        p.active = false;
+      } else if (reason === 'aucun pari actif') {
+        p.active = false;
+        flash(p, 'Aucune mise active', 'lose');
+      } else {
+        // Raison inconnue : la mise reste active (le bouton ENCAISSER redevient disponible).
+        flash(p, 'Encaissement refusé', 'lose');
+      }
       buzz(80);
     }
     render(p);
@@ -274,11 +331,22 @@ export function initBets({ socket, panelsEl }) {
     if (type === 'ROUND_START') {
       st.phase = 'betting';
       st.mult = 1;
+      const seq = ++st.roundSeq;
       panels.forEach((p) => {
         p.active = false; p.pending = false; p.cashing = false;
-        if (p.queued || p.autoBetEl.checked) { p.queued = false; placeBet(p, true); }
+        p.unconfirmed = false; p.crashFlashed = false; p.debited = 0;
         render(p);
       });
+      // Délai court : à la reconnexion le serveur envoie ROUND_START puis BET_ACCEPTED pour les
+      // mises déjà placées. Placer l'auto-bet immédiatement créerait une seconde mise (nouveau
+      // betId) sur un panneau déjà occupé.
+      setTimeout(() => {
+        if (seq !== st.roundSeq || st.phase !== 'betting') return;
+        panels.forEach((p) => {
+          if (p.active || p.pending) return;
+          if (p.queued || p.autoBetEl.checked) { p.queued = false; placeBet(p, true); }
+        });
+      }, SYNC_GRACE_MS);
     } else if (type === 'TICK') {
       const m = Number(data && data.multiplier);
       if (!Number.isFinite(m)) return;
@@ -292,8 +360,14 @@ export function initBets({ socket, panelsEl }) {
       panels.forEach((p) => {
         if (p.active && !p.cashing) {
           const ac = Number(p.autoEl.value) >= 1.01 ? Number(p.autoEl.value) : null;
-          if (ac && Number.isFinite(cp) && cp >= ac) flash(p, `+${fmt(p.stake * ac)} @ ${ac.toFixed(2)}x`, 'win');
-          else flash(p, `−${fmt(p.stake)} · ${Number.isFinite(cp) ? cp.toFixed(2) : '?'}x`, 'lose');
+          // Cas ambigu (crash >= auto-cashout) : l'auto-cashout n'est évalué qu'aux ticks, la mise
+          // a pu être encaissée OU perdue. On n'affiche rien et on attend CASHOUT_ACCEPTED /
+          // CASHOUT_REJECTED du serveur plutôt que d'annoncer un gain non confirmé.
+          const ambiguous = ac !== null && Number.isFinite(cp) && cp >= ac;
+          if (!ambiguous) {
+            flash(p, `−${fmt(p.stake)} · ${Number.isFinite(cp) ? cp.toFixed(2) : '?'}x`, 'lose');
+            p.crashFlashed = true;
+          }
           p.active = false;
           p.pending = false;
         }
@@ -305,7 +379,13 @@ export function initBets({ socket, panelsEl }) {
   function setInteractive(enabled) {
     st.connected = !!enabled;
     panelsEl.classList.toggle('panels-disabled', !enabled);
-    if (!enabled) panels.forEach((p) => { p.pending = false; p.cashing = false; p.queued = false; });
+    if (!enabled) {
+      panels.forEach((p) => {
+        // Une mise partie sans réponse peut avoir été traitée : même état « non confirmé » qu'un timeout.
+        if (p.pending && !p.cashing) p.unconfirmed = true;
+        p.pending = false; p.cashing = false; p.queued = false;
+      });
+    }
     renderAll();
   }
 

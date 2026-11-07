@@ -18,8 +18,8 @@ import (
 
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/game"
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
 	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
+	"github.com/tiidiio/223Gaming/internal/provider/ledger"
 )
 
 // Tests d'intégration de handleBet : engine réel + Ledger sur MongoDB (MONGO_TEST_URI, base jetable

@@ -10,7 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
+	"github.com/tiidiio/223Gaming/internal/provider/ledger"
 )
 
 // NewQueue réutilise la connexion Mongo déjà ouverte (db) au lieu d'en ouvrir une nouvelle —

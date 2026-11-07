@@ -18,8 +18,8 @@ import (
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/game"
 	"github.com/tiidiio/223Gaming/223Crash/internal/provider"
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
 	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
+	"github.com/tiidiio/223Gaming/internal/provider/ledger"
 )
 
 // centimesPerUnit convertit l'unité majeure affichée au joueur (frontend, step=1)
@@ -136,7 +136,7 @@ type gateway struct {
 	credits      *creditSettler
 
 	mu      sync.RWMutex
-	clients map[string]*client // playerID -> client
+	clients map[string]*client // engineID (operatorID:playerID) -> client
 }
 
 func newGateway(eng *engine.CrashEngine, jwtSecret string, walletClient *wallet.Client, walletQueue *wallet.Queue, ldg *ledger.Ledger) *gateway {
@@ -153,18 +153,18 @@ func newGateway(eng *engine.CrashEngine, jwtSecret string, walletClient *wallet.
 
 func (gw *gateway) register(c *client) {
 	gw.mu.Lock()
-	if old, ok := gw.clients[c.playerID]; ok {
+	if old, ok := gw.clients[c.engineID()]; ok {
 		_ = old.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4001, "session_replaced"), time.Now().Add(time.Second))
 		old.conn.Close()
 	}
-	gw.clients[c.playerID] = c
+	gw.clients[c.engineID()] = c
 	gw.mu.Unlock()
 }
 
 func (gw *gateway) unregister(c *client) {
 	gw.mu.Lock()
-	if cur, ok := gw.clients[c.playerID]; ok && cur == c {
-		delete(gw.clients, c.playerID)
+	if cur, ok := gw.clients[c.engineID()]; ok && cur == c {
+		delete(gw.clients, c.engineID())
 	}
 	gw.mu.Unlock()
 	c.closeOnce.Do(func() { close(c.done) })
@@ -498,6 +498,17 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 		}
 	}
 
+	// Nouveau betId : si le panel porte déjà un pari en cours, ce DEBIT ne pourrait produire aucun pari.
+	// On le clôture AVANT tout appel wallet (aucun mouvement d'argent) et on resynchronise le client.
+	if existing, getErr := gw.eng.GetPanelBet(c.engineID(), panel); getErr == nil && existing.State == game.BetPending {
+		if _, fErr := gw.ledger.Fail(opCtx, debitEntry.TransactionID, "panel occupé"); fErr != nil {
+			log.Printf("ledger: fail debit (panel occupé) txn=%s: %v", debitEntry.TransactionID, fErr)
+		}
+		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": errPanelOccupied.Error()}})
+		gw.announceExistingBet(c, panel, msg.Slot)
+		return
+	}
+
 	// created == true : ce goroutine est seul responsable de l'appel wallet pour ce betId —
 	// garanti par l'index unique idempotencyKey de internal/provider/ledger (InsertOne atomique
 	// côté MongoDB, jamais une simple vérification applicative).
@@ -513,7 +524,7 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 			confirmed = debitEntry // best effort : le DEBIT est accepté côté wallet quoi qu'il arrive au Ledger
 		}
 		c.sendJSON(map[string]any{"type": "BALANCE", "balance": centimesToUnits(balance)})
-		gw.placeBetOrReuse(c, msg, panel, amount, cashoutTarget, round, confirmed)
+		gw.placeBetOrReuseEx(c, msg, panel, amount, cashoutTarget, round, confirmed, true)
 	case wallet.OutcomeRejected:
 		reason := ""
 		if err != nil {
@@ -573,10 +584,24 @@ func (gw *gateway) waitForLedgerResolution(ctx context.Context, txnID ledger.Tra
 // pour le même betId : une seule gagne, les autres retrouvent le pari existant et le renvoient
 // tel quel — aucune nouvelle opération financière n'est déclenchée dans les deux cas.
 func (gw *gateway) placeBetOrReuse(c *client, msg clientMessage, panel game.BetPanel, amount int64, cashoutTarget float64, round *game.Round, debitEntry *ledger.Entry) {
-	bet, err := gw.eng.PlaceBet(c.playerID, panel, amount, cashoutTarget)
+	// Chemin d'un retry : DEBIT retrouvé via l'idempotence, un pari existant est légitime.
+	gw.placeBetOrReuseEx(c, msg, panel, amount, cashoutTarget, round, debitEntry, false)
+}
+
+// placeBetOrReuseEx : fresh == true signifie que ce DEBIT vient d'être créé par cet appel (nouveau betId).
+// ErrBetAlreadyExists désigne alors forcément le pari d'un AUTRE betId : le débit doit être remboursé.
+func (gw *gateway) placeBetOrReuseEx(c *client, msg clientMessage, panel game.BetPanel, amount int64, cashoutTarget float64, round *game.Round, debitEntry *ledger.Entry, fresh bool) {
+	bet, err := gw.eng.PlaceBet(c.engineID(), panel, amount, cashoutTarget)
 	if err != nil {
 		if errors.Is(err, game.ErrBetAlreadyExists) {
-			existing, getErr := gw.eng.GetPanelBet(c.playerID, panel)
+			// Nouveau DEBIT sur un panel déjà occupé (course avec le contrôle de handleBet) : ce débit ne
+			// correspond à aucun pari. Remboursement, puis resynchronisation sur le pari réel.
+			if fresh {
+				gw.rollbackConfirmedDebit(c, msg, amount, round, debitEntry, errPanelOccupied)
+				gw.announceExistingBet(c, panel, msg.Slot)
+				return
+			}
+			existing, getErr := gw.eng.GetPanelBet(c.engineID(), panel)
 			if getErr != nil {
 				// Incohérence transitoire (ex. le round a été réglé entre les deux lectures) : le
 				// DEBIT reste confirmé et sain, rien à rembourser — on informe seulement le client.

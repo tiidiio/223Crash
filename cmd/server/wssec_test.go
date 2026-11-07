@@ -13,13 +13,18 @@ import (
 var wsTestSecret = []byte("0123456789abcdef0123456789abcdef-test-only")
 
 func wsTestCfg() *wsSecurityCfg {
-	return &wsSecurityCfg{
-		allowedOperators: map[string]struct{}{"opA": {}},
-		allowedOrigins:   map[string]struct{}{},
-		maxTTL:           2 * time.Hour,
-		maxConns:         2,
-		maxBetUnits:      1000,
+	cfg := &wsSecurityCfg{
+		allowedOrigins: map[string]struct{}{},
+		maxTTL:         2 * time.Hour,
+		maxConns:       2,
+		maxBetUnits:    1000,
 	}
+
+	cfg.allowedOperators.Store(&operatorAllowlist{
+		codes: map[string]struct{}{"opA": {}},
+	})
+
+	return cfg
 }
 
 func wsSign(t *testing.T, m jwt.SigningMethod, secret []byte, claims jwt.MapClaims) string {

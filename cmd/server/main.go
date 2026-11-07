@@ -13,11 +13,12 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/tiidiio/223Gaming/223Crash/internal/admin"
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/mongobridge"
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
 	"github.com/tiidiio/223Gaming/223Crash/internal/provider/recovery"
 	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
+	"github.com/tiidiio/223Gaming/internal/provider/ledger"
 )
 
 type healthResponse struct {
@@ -35,7 +36,6 @@ func main() {
 	mongoDB := envOr("MONGO_DB", "223crash")
 	jwtSecret := requireEnv("JWT_SECRET")
 	wsCheckSecretStrength(jwtSecret)
-	_ = wsSecurity()
 	httpPort := envOr("HTTP_PORT", "8080")
 	wsPort := envOr("WS_PORT", "3000")
 	verifyPort := envOr("VERIFY_PORT", "8090")
@@ -50,6 +50,25 @@ func main() {
 		log.Fatalf("mongobridge: %v", err)
 	}
 	defer store.Close(context.Background())
+
+	adminStore, err := admin.NewStore(ctx, store.DB, admin.Config{
+		Email:         requireEnv("ADMIN_EMAIL"),
+		PasswordHash:  requireEnv("ADMIN_PASSWORD_HASH"),
+		SessionSecret: requireEnv("ADMIN_SESSION_SECRET"),
+	})
+	if err != nil {
+		log.Fatalf("admin store: %v", err)
+	}
+
+	// MongoDB doit être injecté avant le premier appel à wsSecurity().
+	setOperatorDatabase(store.DB)
+	wsCfg := wsSecurity()
+
+	if err := refreshAllowedOperators(wsCfg); err != nil {
+		log.Printf("sécurité WS: chargement initial impossible, tous les opérateurs refusés: %v", err)
+	}
+
+	go runOperatorRefresh(ctx, wsCfg, 5*time.Second)
 
 	publisher := mongobridge.NewPublisher(store)
 
@@ -69,7 +88,9 @@ func main() {
 	go walletQueue.Run(ctx)
 	go recovery.New(provLedger, walletClient).Run(ctx)
 
-	eng, err := engine.NewCrashEngine(engine.DefaultConfig())
+	engineConfig := engine.DefaultConfig()
+	engineConfig.NonceStore = admin.NewMongoNonceStore(store.DB)
+	eng, err := engine.NewCrashEngine(engineConfig)
 	if err != nil {
 		log.Fatalf("engine: %v", err)
 	}
@@ -85,6 +106,7 @@ func main() {
 	go forwardEvents(ctx, eng, publisher, gw)
 
 	static := http.NewServeMux()
+	static.Handle("/api/admin/", admin.NewHandler(adminStore))
 	registerProviderConsole(static)
 	static.HandleFunc("/", serveStatic)
 	static.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

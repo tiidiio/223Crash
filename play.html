@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f1a">
+<title>223CRASH</title>
+<link rel="stylesheet" href="ui.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">223<span>CRASH</span></div>
+    <div class="balance"><span class="balance-label">SOLDE</span><span id="balance-display">—</span></div>
+    <div class="top-actions">
+      <span id="status-chip" class="chip" data-state="off">Connexion…</span>
+      <button id="sound-btn" type="button" class="icon-btn" aria-pressed="false" aria-label="Activer le son">🔇</button>
+      <button id="fair-btn" type="button" class="icon-btn" aria-label="Équité du jeu">✔</button>
+    </div>
+  </header>
+
+  <section id="history" class="history" aria-label="Derniers crashs"></section>
+
+  <section id="stage" class="stage" data-phase="idle">
+    <canvas id="stage-canvas"></canvas>
+    <div class="stage-overlay">
+      <div id="mult" class="mult" data-state="idle">1.00x</div>
+      <div id="phase" class="phase">En attente du serveur…</div>
+    </div>
+    <div class="countdown"><div id="count-bar" class="count-bar"></div></div>
+  </section>
+
+  <main id="panels" class="panels"></main>
+</div>
+
+<dialog id="fair-dlg" class="dlg">
+  <h2>Équité du jeu</h2>
+  <dl>
+    <dt>Manche en cours</dt><dd id="fair-round">—</dd>
+    <dt>Hash de la graine serveur</dt><dd id="fair-hash">—</dd>
+    <dt>Dernier crash</dt><dd id="fair-last">—</dd>
+  </dl>
+  <p class="dim">Le hash est engagé avant l'ouverture des mises : il ne peut plus changer pendant la manche.</p>
+  <div class="dlg-actions">
+    <button id="fair-copy" type="button" class="btn">Copier le hash</button>
+    <button id="fair-close" type="button" class="btn btn-main">Fermer</button>
+  </div>
+</dialog>
+
+<div id="replaced" class="overlay" hidden>
+  <div class="overlay-box">
+    <h2>Session ouverte ailleurs</h2>
+    <p>Ce compte est connecté sur un autre appareil ou onglet.</p>
+    <button id="replaced-reload" type="button" class="btn btn-main">Reprendre ici</button>
+  </div>
+</div>
+
+<div id="fatal" class="overlay" hidden>
+  <div class="overlay-box">
+    <h2>Accès impossible</h2>
+    <p id="fatal-msg"></p>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script type="module" src="ui-main.js"></script>
+</body>
+</html>

@@ -13,13 +13,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
 	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
+	"github.com/tiidiio/223Gaming/internal/provider/ledger"
 )
 
 type Store interface {
 	ListPendingOlderThan(ctx context.Context, before time.Time) ([]ledger.Entry, error)
-	GetByIdempotencyKey(ctx context.Context, key ledger.IdempotencyKey) (*ledger.Entry, error)
+	GetByIdempotencyKey(ctx context.Context, operatorID ledger.OperatorID, key ledger.IdempotencyKey) (*ledger.Entry, error)
 	GetByTransactionID(ctx context.Context, txnID ledger.TransactionID) (*ledger.Entry, error)
 	Begin(ctx context.Context, e ledger.NewEntry) (*ledger.Entry, bool, error)
 	Confirm(ctx context.Context, txnID ledger.TransactionID, operatorBalanceAfterMinor *int64) (*ledger.Entry, error)
@@ -61,6 +61,7 @@ func (s *Sweeper) Run(ctx context.Context) {
 	log.Printf("recovery: sweeper actif (debit>%s, credit/rollback>%s, age max %s)", s.debitAfter, s.moneyAfter, s.maxAge)
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -78,6 +79,7 @@ func (s *Sweeper) RunOnce(ctx context.Context) {
 		log.Printf("recovery: list pending: %v", err)
 		return
 	}
+
 	handled, stale := 0, 0
 	for _, e := range entries {
 		if ctx.Err() != nil {
@@ -90,10 +92,12 @@ func (s *Sweeper) RunOnce(ctx context.Context) {
 		if handled >= s.batch {
 			break
 		}
+
 		switch e.Type {
 		case ledger.EntryDebit:
 			handled++
 			s.recoverDebit(ctx, e)
+
 		case ledger.EntryCredit, ledger.EntryRollback:
 			if e.CreatedAt.After(now.Add(-s.moneyAfter)) {
 				continue
@@ -102,6 +106,7 @@ func (s *Sweeper) RunOnce(ctx context.Context) {
 			s.recoverMoney(ctx, e)
 		}
 	}
+
 	if stale != s.lastStale {
 		s.lastStale = stale
 		log.Printf("recovery: %d entrée(s) PENDING > %s ignorée(s) — réconciliation manuelle requise", stale, s.maxAge)
@@ -134,6 +139,7 @@ func debitCallback(e ledger.Entry) (wallet.Callback, bool) {
 	if !ok {
 		return wallet.Callback{}, false
 	}
+
 	return wallet.Callback{
 		ID:             fmt.Sprintf("debit-%s-%s-%s", e.OperatorID, e.PlayerID, bet),
 		Type:           wallet.CallbackDebit,
@@ -154,6 +160,7 @@ func creditCallback(e ledger.Entry) (wallet.Callback, bool) {
 	if !ok {
 		return wallet.Callback{}, false
 	}
+
 	return wallet.Callback{
 		ID:             fmt.Sprintf("credit-%s-%s-%s", e.OperatorID, e.PlayerID, bet),
 		Type:           wallet.CallbackCredit,
@@ -170,10 +177,19 @@ func creditCallback(e ledger.Entry) (wallet.Callback, bool) {
 }
 
 func rollbackCallback(e ledger.Entry, parent *ledger.Entry) (wallet.Callback, bool) {
+	if parent == nil ||
+		e.OperatorID != parent.OperatorID ||
+		e.PlayerID != parent.PlayerID ||
+		e.GameID != parent.GameID ||
+		e.ParentTransactionID != parent.TransactionID {
+		return wallet.Callback{}, false
+	}
+
 	bet, ok := parseKey(string(parent.IdempotencyKey), "debit", parent.OperatorID, parent.PlayerID)
 	if !ok {
 		return wallet.Callback{}, false
 	}
+
 	return wallet.Callback{
 		ID:             fmt.Sprintf("rollback-%s", e.ParentTransactionID),
 		Type:           wallet.CallbackRollback,
@@ -202,6 +218,7 @@ func (s *Sweeper) recoverDebit(ctx context.Context, e ledger.Entry) {
 	if _, ok := s.stillPending(ctx, e.TransactionID); !ok {
 		return
 	}
+
 	cb, ok := debitCallback(e)
 	if !ok {
 		log.Printf("recovery: DEBIT txn=%s clé d'idempotence non reconnue, ignoré", e.TransactionID)
@@ -209,7 +226,7 @@ func (s *Sweeper) recoverDebit(ctx context.Context, e ledger.Entry) {
 	}
 
 	rbKey := ledger.IdempotencyKey(fmt.Sprintf("rollback:%s:%s:%s", e.OperatorID, e.PlayerID, e.TransactionID))
-	rb, err := s.store.GetByIdempotencyKey(ctx, rbKey)
+	rb, err := s.store.GetByIdempotencyKey(ctx, e.OperatorID, rbKey)
 	hasMarker := err == nil
 	if err != nil && !errors.Is(err, ledger.ErrEntryNotFound) {
 		log.Printf("recovery: lecture marqueur rollback txn=%s: %v", e.TransactionID, err)
@@ -257,6 +274,7 @@ func (s *Sweeper) recoverDebit(ctx context.Context, e ledger.Entry) {
 				return
 			}
 		}
+
 		b := bal
 		if _, cErr := s.store.Confirm(ctx, e.TransactionID, &b); cErr != nil {
 			log.Printf("recovery: confirm debit txn=%s: %v", e.TransactionID, cErr)
@@ -266,6 +284,7 @@ func (s *Sweeper) recoverDebit(ctx context.Context, e ledger.Entry) {
 			log.Printf("recovery: WARN DEBIT txn=%s confirmé sans remboursement (entrée du process courant, pari présumé placé)", e.TransactionID)
 			return
 		}
+
 		log.Printf("recovery: DEBIT txn=%s CONFIRMED tardivement, remboursement via ROLLBACK txn=%s", e.TransactionID, rb.TransactionID)
 		if rb.Status == ledger.StatusPending {
 			if rcb, ok := rollbackCallback(*rb, &e); ok {
@@ -282,17 +301,21 @@ func (s *Sweeper) recoverMoney(ctx context.Context, e ledger.Entry) {
 	if _, ok := s.stillPending(ctx, e.TransactionID); !ok {
 		return
 	}
+
 	var cb wallet.Callback
 	var ok bool
+
 	switch e.Type {
 	case ledger.EntryCredit:
 		cb, ok = creditCallback(e)
+
 	case ledger.EntryRollback:
 		parent, err := s.store.GetByTransactionID(ctx, e.ParentTransactionID)
 		if err != nil {
 			log.Printf("recovery: parent introuvable pour ROLLBACK txn=%s: %v", e.TransactionID, err)
 			return
 		}
+
 		switch parent.Status {
 		case ledger.StatusPending:
 			return // résolu par recoverDebit
@@ -302,12 +325,15 @@ func (s *Sweeper) recoverMoney(ctx context.Context, e ledger.Entry) {
 			}
 			return
 		}
+
 		cb, ok = rollbackCallback(e, parent)
 	}
+
 	if !ok {
 		log.Printf("recovery: %s txn=%s clé d'idempotence non reconnue, ignoré", e.Type, e.TransactionID)
 		return
 	}
+
 	s.sendAndResolve(ctx, e, cb)
 }
 
@@ -315,6 +341,7 @@ func (s *Sweeper) sendAndResolve(ctx context.Context, e ledger.Entry, cb wallet.
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	bal, outcome, err := s.sender.Send(sctx, cb)
 	cancel()
+
 	switch outcome {
 	case wallet.OutcomeAccepted:
 		b := bal
@@ -323,6 +350,7 @@ func (s *Sweeper) sendAndResolve(ctx context.Context, e ledger.Entry, cb wallet.
 			return
 		}
 		log.Printf("recovery: %s txn=%s CONFIRMED après reprise", e.Type, e.TransactionID)
+
 	case wallet.OutcomeRejected:
 		reason := "rejeté lors de la reprise"
 		if err != nil {
@@ -333,6 +361,7 @@ func (s *Sweeper) sendAndResolve(ctx context.Context, e ledger.Entry, cb wallet.
 			return
 		}
 		log.Printf("recovery: ALERTE %s txn=%s player=%s montant=%d REJETÉ — réconciliation manuelle requise", e.Type, e.TransactionID, e.PlayerID, e.AmountMinor)
+
 	default:
 		log.Printf("recovery: %s txn=%s toujours indéterminé: %v", e.Type, e.TransactionID, err)
 	}

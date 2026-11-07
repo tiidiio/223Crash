@@ -6,26 +6,38 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
 	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
+	"github.com/tiidiio/223Gaming/internal/provider/ledger"
 )
 
 var base = time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
 
+type idempotencyScope struct {
+	operatorID ledger.OperatorID
+	key        ledger.IdempotencyKey
+}
+
 type fakeStore struct {
 	byTxn map[ledger.TransactionID]*ledger.Entry
-	byKey map[ledger.IdempotencyKey]*ledger.Entry
+	byKey map[idempotencyScope]*ledger.Entry
 	seq   int
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{byTxn: map[ledger.TransactionID]*ledger.Entry{}, byKey: map[ledger.IdempotencyKey]*ledger.Entry{}}
+	return &fakeStore{
+		byTxn: make(map[ledger.TransactionID]*ledger.Entry),
+		byKey: make(map[idempotencyScope]*ledger.Entry),
+	}
+}
+
+func scopeOf(operatorID ledger.OperatorID, key ledger.IdempotencyKey) idempotencyScope {
+	return idempotencyScope{operatorID: operatorID, key: key}
 }
 
 func (f *fakeStore) add(e ledger.Entry) {
 	c := e
 	f.byTxn[c.TransactionID] = &c
-	f.byKey[c.IdempotencyKey] = &c
+	f.byKey[scopeOf(c.OperatorID, c.IdempotencyKey)] = &c
 }
 
 func (f *fakeStore) ListPendingOlderThan(_ context.Context, before time.Time) ([]ledger.Entry, error) {
@@ -38,8 +50,12 @@ func (f *fakeStore) ListPendingOlderThan(_ context.Context, before time.Time) ([
 	return out, nil
 }
 
-func (f *fakeStore) GetByIdempotencyKey(_ context.Context, k ledger.IdempotencyKey) (*ledger.Entry, error) {
-	if e, ok := f.byKey[k]; ok {
+func (f *fakeStore) GetByIdempotencyKey(
+	_ context.Context,
+	operatorID ledger.OperatorID,
+	k ledger.IdempotencyKey,
+) (*ledger.Entry, error) {
+	if e, ok := f.byKey[scopeOf(operatorID, k)]; ok {
 		c := *e
 		return &c, nil
 	}
@@ -55,16 +71,25 @@ func (f *fakeStore) GetByTransactionID(_ context.Context, id ledger.TransactionI
 }
 
 func (f *fakeStore) Begin(_ context.Context, n ledger.NewEntry) (*ledger.Entry, bool, error) {
-	if e, ok := f.byKey[n.IdempotencyKey]; ok {
+	scope := scopeOf(n.OperatorID, n.IdempotencyKey)
+	if e, ok := f.byKey[scope]; ok {
 		c := *e
 		return &c, false, nil
 	}
+
 	f.seq++
 	e := ledger.Entry{
-		TransactionID: ledger.TransactionID(fmt.Sprintf("txn_auto%d", f.seq)), IdempotencyKey: n.IdempotencyKey,
-		GameID: n.GameID, OperatorID: n.OperatorID, PlayerID: n.PlayerID, ExternalRef: n.ExternalRef,
-		ParentTransactionID: n.ParentTransactionID, Type: n.Type, AmountMinor: n.AmountMinor,
-		Status: ledger.StatusPending, CreatedAt: base,
+		TransactionID:       ledger.TransactionID(fmt.Sprintf("txn_auto%d", f.seq)),
+		IdempotencyKey:      n.IdempotencyKey,
+		GameID:              n.GameID,
+		OperatorID:          n.OperatorID,
+		PlayerID:            n.PlayerID,
+		ExternalRef:         n.ExternalRef,
+		ParentTransactionID: n.ParentTransactionID,
+		Type:                n.Type,
+		AmountMinor:         n.AmountMinor,
+		Status:              ledger.StatusPending,
+		CreatedAt:           base,
 	}
 	f.add(e)
 	c := e
@@ -114,18 +139,32 @@ func always(o wallet.Outcome) func(wallet.Callback) (int64, wallet.Outcome, erro
 
 func debitE(txn string, created time.Time) ledger.Entry {
 	return ledger.Entry{
-		TransactionID: ledger.TransactionID(txn), IdempotencyKey: "debit:opA:p1:b1", GameID: "crash",
-		OperatorID: "opA", PlayerID: "p1", ExternalRef: "round=r1|panel=A|amount=1000|autoCashout=0.00",
-		Type: ledger.EntryDebit, AmountMinor: 1000, Status: ledger.StatusPending, CreatedAt: created,
+		TransactionID:  ledger.TransactionID(txn),
+		IdempotencyKey: "debit:opA:p1:b1",
+		GameID:         "crash",
+		OperatorID:     "opA",
+		PlayerID:       "p1",
+		ExternalRef:    "round=r1|panel=A|amount=1000|autoCashout=0.00",
+		Type:           ledger.EntryDebit,
+		AmountMinor:    1000,
+		Status:         ledger.StatusPending,
+		CreatedAt:      created,
 	}
 }
 
 func markerE(created time.Time) ledger.Entry {
 	return ledger.Entry{
-		TransactionID: "txn_r1", IdempotencyKey: "rollback:opA:p1:txn_d1", GameID: "crash",
-		OperatorID: "opA", PlayerID: "p1", ExternalRef: "round=r1|panel=A|amount=1000|autoCashout=0.00",
-		ParentTransactionID: "txn_d1", Type: ledger.EntryRollback, AmountMinor: 1000,
-		Status: ledger.StatusPending, CreatedAt: created,
+		TransactionID:       "txn_r1",
+		IdempotencyKey:      "rollback:opA:p1:txn_d1",
+		GameID:              "crash",
+		OperatorID:          "opA",
+		PlayerID:            "p1",
+		ExternalRef:         "round=r1|panel=A|amount=1000|autoCashout=0.00",
+		ParentTransactionID: "txn_d1",
+		Type:                ledger.EntryRollback,
+		AmountMinor:         1000,
+		Status:              ledger.StatusPending,
+		CreatedAt:           created,
 	}
 }
 
@@ -145,6 +184,43 @@ func status(t *testing.T, st *fakeStore, id string) ledger.EntryStatus {
 	return e.Status
 }
 
+func TestFakeStoreIdempotencyIsScopedByOperator(t *testing.T) {
+	st := newFakeStore()
+
+	first := ledger.NewEntry{
+		GameID:         "crash",
+		OperatorID:     "opA",
+		PlayerID:       "p1",
+		IdempotencyKey: "same-key",
+		Type:           ledger.EntryDebit,
+		AmountMinor:    100,
+	}
+	second := first
+	second.OperatorID = "opB"
+	second.PlayerID = "p2"
+
+	a, createdA, err := st.Begin(context.Background(), first)
+	if err != nil || !createdA {
+		t.Fatalf("première entrée: entry=%+v created=%v err=%v", a, createdA, err)
+	}
+	b, createdB, err := st.Begin(context.Background(), second)
+	if err != nil || !createdB {
+		t.Fatalf("seconde entrée: entry=%+v created=%v err=%v", b, createdB, err)
+	}
+	if a.TransactionID == b.TransactionID {
+		t.Fatal("deux opérateurs distincts ne doivent pas partager le même transactionId")
+	}
+
+	retryA, createdRetryA, err := st.Begin(context.Background(), first)
+	if err != nil || createdRetryA || retryA.TransactionID != a.TransactionID {
+		t.Fatalf("retry opA incorrect: entry=%+v created=%v err=%v", retryA, createdRetryA, err)
+	}
+	retryB, createdRetryB, err := st.Begin(context.Background(), second)
+	if err != nil || createdRetryB || retryB.TransactionID != b.TransactionID {
+		t.Fatalf("retry opB incorrect: entry=%+v created=%v err=%v", retryB, createdRetryB, err)
+	}
+}
+
 func TestMarkerDebitAcceptedTriggersRollback(t *testing.T) {
 	st, sd := newFakeStore(), &fakeSender{fn: always(wallet.OutcomeAccepted)}
 	st.add(debitE("txn_d1", base.Add(-2*time.Minute)))
@@ -159,11 +235,13 @@ func TestMarkerDebitAcceptedTriggersRollback(t *testing.T) {
 	if len(sd.calls) != 2 {
 		t.Fatalf("attendu 2 appels wallet, obtenu %d", len(sd.calls))
 	}
+
 	d, r := sd.calls[0], sd.calls[1]
 	if d.Type != wallet.CallbackDebit || d.IdempotencyKey != "debit:opA:p1:b1" || d.BetID != "b1" || d.RoundID != "r1" {
 		t.Fatalf("callback debit inattendu: %+v", d)
 	}
-	if r.Type != wallet.CallbackRollback || r.IdempotencyKey != "rollback:opA:p1:txn_d1" || r.ID != "rollback-txn_d1" || r.BetID != "b1" || r.Amount != 1000 {
+	if r.Type != wallet.CallbackRollback || r.IdempotencyKey != "rollback:opA:p1:txn_d1" ||
+		r.ID != "rollback-txn_d1" || r.BetID != "b1" || r.Amount != 1000 {
 		t.Fatalf("callback rollback inattendu: %+v", r)
 	}
 
@@ -205,7 +283,7 @@ func TestNoMarkerCrashRecoveryRefunds(t *testing.T) {
 	st.add(debitE("txn_d1", base.Add(-2*time.Minute)))
 	newSweeper(st, sd, base.Add(-time.Minute)).RunOnce(context.Background()) // entrée antérieure au démarrage
 
-	rb, ok := st.byKey["rollback:opA:p1:txn_d1"]
+	rb, ok := st.byKey[scopeOf("opA", "rollback:opA:p1:txn_d1")]
 	if !ok || rb.Status != ledger.StatusConfirmed || rb.ParentTransactionID != "txn_d1" {
 		t.Fatalf("rollback attendu CONFIRMED lié au débit: %+v", rb)
 	}
@@ -251,7 +329,8 @@ func TestOrphanCreditResent(t *testing.T) {
 		t.Fatal("seul le crédit ancien doit être repris")
 	}
 	c := sd.calls[0]
-	if len(sd.calls) != 1 || c.Type != wallet.CallbackCredit || c.ID != "credit-opA-p1-b9" || c.RoundID != "r1" || c.BetID != "b9" || c.Amount != 2500 {
+	if len(sd.calls) != 1 || c.Type != wallet.CallbackCredit || c.ID != "credit-opA-p1-b9" ||
+		c.RoundID != "r1" || c.BetID != "b9" || c.Amount != 2500 {
 		t.Fatalf("callback crédit inattendu: %+v", c)
 	}
 }
@@ -266,5 +345,21 @@ func TestRollbackWithFailedParentIsClosedWithoutSend(t *testing.T) {
 
 	if status(t, st, "txn_r1") != ledger.StatusFailed || len(sd.calls) != 0 {
 		t.Fatal("marqueur orphelin : doit passer FAILED sans appel wallet")
+	}
+}
+
+func TestRollbackCallbackRejectsDifferentOperatorOrPlayer(t *testing.T) {
+	parent := debitE("txn_d1", base.Add(-2*time.Minute))
+	rollback := markerE(base.Add(-2 * time.Minute))
+
+	rollback.OperatorID = "opB"
+	if _, ok := rollbackCallback(rollback, &parent); ok {
+		t.Fatal("un rollback d'un autre opérateur ne doit pas produire de callback")
+	}
+
+	rollback = markerE(base.Add(-2 * time.Minute))
+	rollback.PlayerID = "p2"
+	if _, ok := rollbackCallback(rollback, &parent); ok {
+		t.Fatal("un rollback d'un autre joueur ne doit pas produire de callback")
 	}
 }

@@ -8,17 +8,24 @@ export class CrashSocket extends EventTarget {
     this.reconnectAttempts = 0;
     this.maxReconnectDelay = 8000;
     this._manualClose = false;
+    this._stopped = false;
+    this._reconnectTimer = null;
 
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.heartbeatTimeoutMs = heartbeatTimeoutMs;
     this._hbInterval = null;
     this._hbTimeout = null;
+    this._lastRx = 0;
+    this._lastBeat = 0;
+    this._misses = 0;
 
     // Timeout d'action par slot : si aucune réponse (BET_ACCEPTED/REJECTED,
     // CASHOUT_ACCEPTED/REJECTED) n'arrive dans actionTimeoutMs, on émet
-    // 'actionTimeout' pour que l'UI débloque le bouton au lieu de rester figée.
+    // 'actionTimeout' ({ slot, action, betId }) pour que l'UI débloque le bouton au lieu de
+    // rester figée. `action` vaut 'bet' ou 'cashout' : l'UI doit traiter les deux cas
+    // différemment (un bet sans réponse peut encore être débité côté serveur).
     this.actionTimeoutMs = actionTimeoutMs;
-    this._pendingBySlot = new Map(); // slot -> timeoutId
+    this._pendingBySlot = new Map(); // slot -> { timer, action, betId }
 
     // betId actif par slot : conservé tant qu'aucune réponse DÉFINITIVE (BET_ACCEPTED/REJECTED)
     // n'est reçue pour ce slot, y compris après un actionTimeout (qui réactive le bouton côté UI
@@ -31,20 +38,31 @@ export class CrashSocket extends EventTarget {
   }
 
   connect() {
-    this._manualClose = false;
-    const wsUrl = `${this.url}?token=${encodeURIComponent(this.token)}`;
-    this.ws = new WebSocket(wsUrl);
+    // Déjà en cours de connexion ou connecté : pas de second socket.
+    if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) return;
 
-    this.ws.addEventListener('open', () => {
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
+    this._manualClose = false;
+    this._stopped = false;
+
+    const wsUrl = `${this.url}?token=${encodeURIComponent(this.token)}`;
+    const sock = new WebSocket(wsUrl);
+    this.ws = sock;
+
+    sock.addEventListener('open', () => {
+      if (this.ws !== sock) return;
       this.reconnectAttempts = 0;
       this._emit('status', { state: 'connected' });
       this._startHeartbeat();
       this.join();
     });
 
-    this.ws.addEventListener('message', (ev) => {
+    sock.addEventListener('message', (ev) => {
+      if (this.ws !== sock) return;
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
+      if (!msg || typeof msg !== 'object') return;
       if (msg.type === 'PONG') {
         this._onPong();
         return;
@@ -52,7 +70,9 @@ export class CrashSocket extends EventTarget {
       this._route(msg);
     });
 
-    this.ws.addEventListener('close', (ev) => {
+    sock.addEventListener('close', (ev) => {
+      // Événement d'un ancien socket déjà remplacé : ne doit rien toucher à l'état courant.
+      if (this.ws !== sock) return;
       if (ev.code === 4001) { // session ouverte ailleurs : pas de reconnexion en boucle
         this._stopped = true;
         this._stopHeartbeat();
@@ -66,7 +86,8 @@ export class CrashSocket extends EventTarget {
       if (!this._manualClose) this._scheduleReconnect();
     });
 
-    this.ws.addEventListener('error', () => {
+    sock.addEventListener('error', () => {
+      if (this.ws !== sock) return;
       this._emit('status', { state: 'error' });
     });
   }
@@ -109,32 +130,42 @@ export class CrashSocket extends EventTarget {
   }
 
   _scheduleReconnect() {
-    if (this._stopped) return;
+    if (this._stopped || this._manualClose) return;
+    clearTimeout(this._reconnectTimer);
     const base = Math.min(500 * 2 ** this.reconnectAttempts, this.maxReconnectDelay);
     const jitter = base * (0.5 + Math.random() * 0.5); // 50%-100% du délai, évite le thundering herd
     this.reconnectAttempts++;
     this._emit('status', { state: 'reconnecting' });
-    setTimeout(() => this.connect(), jitter);
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      this.connect();
+    }, jitter);
   }
 
-  _armActionTimeout(slot) {
+  _armActionTimeout(slot, action, betId = null) {
     this._clearActionTimeout(slot);
-    const t = setTimeout(() => {
+    const timer = setTimeout(() => {
       this._pendingBySlot.delete(slot);
-      this._emit('actionTimeout', { slot });
+      this._emit('actionTimeout', { slot, action, betId });
     }, this.actionTimeoutMs);
-    this._pendingBySlot.set(slot, t);
+    this._pendingBySlot.set(slot, { timer, action, betId });
   }
 
   _clearActionTimeout(slot) {
-    const t = this._pendingBySlot.get(slot);
-    if (t) clearTimeout(t);
+    const entry = this._pendingBySlot.get(slot);
+    if (entry) clearTimeout(entry.timer);
     this._pendingBySlot.delete(slot);
   }
 
   _clearAllPending() {
-    for (const t of this._pendingBySlot.values()) clearTimeout(t);
+    for (const entry of this._pendingBySlot.values()) clearTimeout(entry.timer);
     this._pendingBySlot.clear();
+  }
+
+  // Action en attente de réponse pour ce slot ('bet' | 'cashout' | null).
+  pendingAction(slot) {
+    const entry = this._pendingBySlot.get(slot);
+    return entry ? entry.action : null;
   }
 
   // Génère un identifiant de pari opaque et suffisamment unique pour servir de clé
@@ -199,7 +230,7 @@ export class CrashSocket extends EventTarget {
     return false;
   }
 
-  join() { this._send({ action: 'join' }); }
+  join() { return this._send({ action: 'join' }); }
 
   bet(slot, amount, autoCashout = null) {
     // Réutilise le betId déjà en vol pour ce slot s'il y en a un (retry après actionTimeout,
@@ -207,23 +238,31 @@ export class CrashSocket extends EventTarget {
     // réutilisation, combinée à l'idempotency côté serveur, qui garantit qu'une même tentative
     // logique de pari ne produit jamais deux débits même en cas de retry.
     let betId = this._betIdBySlot.get(slot);
-    if (!betId) {
+    const isNew = !betId;
+    if (isNew) {
       betId = this._genBetId();
       this._betIdBySlot.set(slot, betId);
     }
     const ok = this._send({ action: 'bet', betId, slot, amount, autoCashout });
-    if (ok) this._armActionTimeout(slot);
+    if (ok) {
+      this._armActionTimeout(slot, 'bet', betId);
+    } else if (isNew) {
+      // Rien n'est parti : ne pas conserver un betId qui n'a jamais atteint le serveur.
+      this._betIdBySlot.delete(slot);
+    }
     return ok;
   }
 
   cashout(slot) {
     const ok = this._send({ action: 'cashout', slot });
-    if (ok) this._armActionTimeout(slot);
+    if (ok) this._armActionTimeout(slot, 'cashout');
     return ok;
   }
 
   close() {
     this._manualClose = true;
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
     this._stopHeartbeat();
     this._clearAllPending();
     this.ws?.close(1000);

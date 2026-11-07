@@ -8,25 +8,52 @@ import (
 	"time"
 
 	"github.com/tiidiio/223Gaming/223Crash/internal/game"
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
+	"github.com/tiidiio/223Gaming/internal/provider/ledger"
 )
 
-func refundKey(c *client, debit *ledger.Entry) ledger.IdempotencyKey {
-	return ledger.IdempotencyKey(fmt.Sprintf("rollback:%s:%s:%s", c.operatorID, c.playerID, debit.TransactionID))
+func refundKey(debit *ledger.Entry) ledger.IdempotencyKey {
+	if debit == nil {
+		return ""
+	}
+	return ledger.IdempotencyKey(fmt.Sprintf(
+		"rollback:%s:%s:%s",
+		debit.OperatorID,
+		debit.PlayerID,
+		debit.TransactionID,
+	))
+}
+
+func validateDebitClient(c *client, debit *ledger.Entry) error {
+	if c == nil {
+		return errors.New("client absent")
+	}
+	if debit == nil {
+		return errors.New("entrée débit absente")
+	}
+	if c.operatorID != string(debit.OperatorID) || c.playerID != string(debit.PlayerID) {
+		return errors.New("identité client différente de l'identité du débit")
+	}
+	return nil
 }
 
 // markDebitForRefund : sur OutcomeUnknown, le joueur reçoit un rejet mais le wallet a pu débiter.
 // L'entrée ROLLBACK PENDING est le marqueur « si ce débit a eu lieu, il faut le rembourser » ;
 // le sweeper (internal/provider/recovery) la résout.
 func (gw *gateway) markDebitForRefund(c *client, debit *ledger.Entry, amount int64) {
+	if err := validateDebitClient(c, debit); err != nil {
+		log.Printf("ledger: marqueur de remboursement refusé: %v", err)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+
 	_, _, err := gw.ledger.Begin(ctx, ledger.NewEntry{
-		GameID:              productGameID,
-		OperatorID:          ledger.OperatorID(c.operatorID),
-		PlayerID:            ledger.PlayerID(c.playerID),
+		GameID:              debit.GameID,
+		OperatorID:          debit.OperatorID,
+		PlayerID:            debit.PlayerID,
 		ExternalRef:         debit.ExternalRef,
-		IdempotencyKey:      refundKey(c, debit),
+		IdempotencyKey:      refundKey(debit),
 		Type:                ledger.EntryRollback,
 		AmountMinor:         amount,
 		ParentTransactionID: debit.TransactionID,
@@ -39,9 +66,14 @@ func (gw *gateway) markDebitForRefund(c *client, debit *ledger.Entry, amount int
 // debitMarkedForRefund : vrai si un remboursement existe pour ce débit (le pari ne doit alors
 // jamais être placé). Une erreur de lecture est renvoyée : l'appelant refuse sans placer le pari.
 func (gw *gateway) debitMarkedForRefund(c *client, debit *ledger.Entry) (bool, error) {
+	if err := validateDebitClient(c, debit); err != nil {
+		return false, err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, err := gw.ledger.GetByIdempotencyKey(ctx, refundKey(c, debit))
+
+	_, err := gw.ledger.GetByIdempotencyKey(ctx, debit.OperatorID, refundKey(debit))
 	if err == nil {
 		return true, nil
 	}
@@ -54,7 +86,7 @@ func (gw *gateway) debitMarkedForRefund(c *client, debit *ledger.Entry) (bool, e
 // rehydrateBets restaure les mises PENDING du joueur après reconnexion (cashout et auto-cashout).
 func (gw *gateway) rehydrateBets(c *client) {
 	for _, p := range []game.BetPanel{game.Panel1, game.Panel2} {
-		b, err := gw.eng.GetPanelBet(c.playerID, p)
+		b, err := gw.eng.GetPanelBet(c.engineID(), p)
 		if err != nil || b.State != game.BetPending {
 			continue
 		}

@@ -21,7 +21,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/tiidiio/223Gaming/223Crash/internal/provider"
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider/ledger"
+	"github.com/tiidiio/223Gaming/internal/provider/ledger"
 )
 
 type testEnv struct {
