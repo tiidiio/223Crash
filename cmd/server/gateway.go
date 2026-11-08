@@ -135,6 +135,11 @@ type gateway struct {
 	ledger       ledgerAPI
 	credits      *creditSettler
 
+	// rb règle les remboursements (voir rollback_settle.go). Créé à la demande par
+	// rollbackSettler() à partir de ledger et walletQueue, sauf s'il est injecté (tests).
+	rb     *rollbackSettler
+	rbOnce sync.Once
+
 	// refs relie chaque DEBIT confirmé à son pari moteur (placement idempotent, voir bet_refs.go).
 	refs betRefTable
 
@@ -152,6 +157,16 @@ func newGateway(eng *engine.CrashEngine, jwtSecret string, walletClient *wallet.
 		credits:      newCreditSettler(ldg, walletQueue, productGameID),
 		clients:      make(map[string]*client),
 	}
+}
+
+// rollbackSettler renvoie le settler de remboursements de la gateway.
+func (gw *gateway) rollbackSettler() *rollbackSettler {
+	gw.rbOnce.Do(func() {
+		if gw.rb == nil {
+			gw.rb = newRollbackSettler(gw.ledger, gw.walletQueue, productGameID)
+		}
+	})
+	return gw.rb
 }
 
 func (gw *gateway) register(c *client) {
@@ -535,8 +550,13 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 	case wallet.OutcomeAccepted:
 		confirmed, cErr := gw.ledger.Confirm(opCtx, debitEntry.TransactionID, &balance)
 		if cErr != nil {
-			log.Printf("ledger: confirm debit txn=%s: %v", debitEntry.TransactionID, cErr)
-			confirmed = debitEntry // best effort : le DEBIT est accepté côté wallet quoi qu'il arrive au Ledger
+			// Le wallet a débité : le pari doit suivre son cours. L'entrée reste PENDING côté Ledger,
+			// donc on répare le Confirm en arrière-plan (idempotent) au lieu de l'abandonner ; tant
+			// qu'il n'est pas réparé, aucune décision de remboursement ne doit en dépendre.
+			log.Printf("ledger: CRITIQUE confirm debit en échec alors que le wallet a accepté txn=%s: %v — réparation en arrière-plan", debitEntry.TransactionID, cErr)
+			confirmed = debitEntry
+			bal := balance
+			gw.rollbackSettler().confirmInBackground(debitEntry.TransactionID, &bal)
 		}
 		c.sendJSON(map[string]any{"type": "BALANCE", "balance": centimesToUnits(balance)})
 		gw.placeBetOrReuseEx(c, msg, panel, amount, cashoutTarget, round, confirmed, true)
@@ -670,45 +690,27 @@ func (gw *gateway) reportUnplacedDebit(c *client, msg clientMessage, debit *ledg
 		debit.TransactionID, c.operatorID, c.playerID, msg.BetID, debit.AmountMinor, debit.ExternalRef, cause)
 }
 
-// rollbackConfirmedDebit rembourse un DEBIT déjà CONFIRMED lorsque PlaceBet échoue pour une
-// raison qui n'est PAS un doublon (ErrBetAlreadyExists — voir placeBetOrReuse) : round fermé
-// entre-temps, état interne incohérent, etc. Le ROLLBACK ouvre sa PROPRE entrée Ledger
-// (ParentTransactionID = TransactionID du DEBIT), jamais une réécriture du DEBIT existant — la
-// chaîne comptable DEBIT → ROLLBACK reste auditable. Asynchrone via la Queue, idempotent au même
-// titre que le DEBIT (clé scopée operator/player/transactionId, jamais réutilisable pour un
-// autre DEBIT). Réservé aux débits NEUFS (fresh == true).
+// rollbackConfirmedDebit rembourse un DEBIT NEUF accepté par le wallet lorsque PlaceBet échoue
+// pour une raison qui n'est PAS un rejeu (round fermé entre-temps, panel pris, état interne
+// incohérent). Le ROLLBACK ouvre sa PROPRE entrée Ledger (ParentTransactionID = TransactionID du
+// DEBIT), jamais une réécriture du DEBIT : la chaîne DEBIT → ROLLBACK reste auditable.
+//
+// Tout le règlement est délégué à rollbackSettler (rollback_settle.go) : aucun callback ROLLBACK
+// sans entrée Ledger durable, un seul enfilage par entrée créée (created == true), clé
+// d'idempotence stable (identique à refundKey), montant lu depuis l'entrée DEBIT (jamais depuis
+// un paramètre), aucune émission si Begin échoue (reprise en arrière-plan). Le paramètre amount
+// est conservé pour la compatibilité des appelants et n'est plus utilisé pour le montant.
 func (gw *gateway) rollbackConfirmedDebit(c *client, msg clientMessage, amount int64, round *game.Round, debitEntry *ledger.Entry, placeErr error) {
-	idemKey := fmt.Sprintf("rollback:%s:%s:%s", c.operatorID, c.playerID, debitEntry.TransactionID)
-	rollbackEntry, _, rbErr := gw.ledger.Begin(context.Background(), ledger.NewEntry{
-		GameID:              productGameID,
-		OperatorID:          ledger.OperatorID(c.operatorID),
-		PlayerID:            ledger.PlayerID(c.playerID),
-		ExternalRef:         debitEntry.ExternalRef,
-		IdempotencyKey:      ledger.IdempotencyKey(idemKey),
-		Type:                ledger.EntryRollback,
-		AmountMinor:         amount,
-		ParentTransactionID: debitEntry.TransactionID,
-	})
-	if rbErr != nil {
-		log.Printf("ledger: begin rollback txn=%s: %v", debitEntry.TransactionID, rbErr)
-	}
-
-	rb := wallet.Callback{
-		ID:             fmt.Sprintf("rollback-%s", debitEntry.TransactionID),
-		Type:           wallet.CallbackRollback,
-		GameID:         productGameID,
-		OperatorID:     c.operatorID,
-		PlayerID:       c.playerID,
-		RoundID:        round.ID,
-		BetID:          msg.BetID,
-		Amount:         amount,
-		IdempotencyKey: idemKey,
-	}
-	if rollbackEntry != nil {
-		rb.TransactionID = rollbackEntry.TransactionID
-	}
-	if qErr := gw.walletQueue.Enqueue(context.Background(), rb); qErr != nil {
-		log.Printf("wallet: enqueue ROLLBACK txn=%s: %v", debitEntry.TransactionID, qErr)
+	if err := validateDebitClient(c, debitEntry); err != nil {
+		log.Printf("ledger: CRITIQUE rollback refusé, identité incohérente betId=%s: %v", msg.BetID, err)
+	} else {
+		out := gw.rollbackSettler().Settle(rollbackRequest{
+			Debit:          debitEntry,
+			RoundID:        round.ID,
+			BetID:          msg.BetID,
+			WalletAccepted: true,
+		})
+		log.Printf("gateway: rollback débit txn=%s betId=%s outcome=%d (param amount=%d, entrée=%d)", debitEntry.TransactionID, msg.BetID, out, amount, debitEntry.AmountMinor)
 	}
 	gw.refreshBalance(c, 800*time.Millisecond, 3*time.Second)
 	c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": betRejectReason(placeErr)}})
