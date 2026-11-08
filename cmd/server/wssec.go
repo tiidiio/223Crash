@@ -39,16 +39,16 @@ const (
 var wsIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 
 type operatorAllowlist struct {
-        codes map[string]struct{}
+	codes map[string]struct{}
 }
 
 type wsSecurityCfg struct {
-        allowedOperators atomic.Pointer[operatorAllowlist]
-        allowedOrigins   map[string]struct{}
-        maxTTL           time.Duration
-        maxConns         int64
-        maxBetUnits      float64
-        conns            atomic.Int64
+	allowedOperators atomic.Pointer[operatorAllowlist]
+	allowedOrigins   map[string]struct{}
+	maxTTL           time.Duration
+	maxConns         int64
+	maxBetUnits      float64
+	conns            atomic.Int64
 }
 
 var (
@@ -114,101 +114,101 @@ func loadActiveOperatorCodes() ([]string, error) {
 // refreshAllowedOperators publie un snapshot atomique des seuls opérateurs actifs.
 // Toute erreur de lecture ou donnée invalide entraîne immédiatement un refus global.
 func refreshAllowedOperators(s *wsSecurityCfg) error {
-        codes, err := loadActiveOperatorCodes()
-        if err != nil {
-                s.allowedOperators.Store(&operatorAllowlist{
-                        codes: map[string]struct{}{},
-                })
-                return err
-        }
+	codes, err := loadActiveOperatorCodes()
+	if err != nil {
+		s.allowedOperators.Store(&operatorAllowlist{
+			codes: map[string]struct{}{},
+		})
+		return err
+	}
 
-        next := make(map[string]struct{}, len(codes))
-        for _, code := range codes {
-                if !wsIDPattern.MatchString(code) {
-                        s.allowedOperators.Store(&operatorAllowlist{
-                                codes: map[string]struct{}{},
-                        })
-                        return errors.New("code opérateur MongoDB invalide")
-                }
-                next[code] = struct{}{}
-        }
+	next := make(map[string]struct{}, len(codes))
+	for _, code := range codes {
+		if !wsIDPattern.MatchString(code) {
+			s.allowedOperators.Store(&operatorAllowlist{
+				codes: map[string]struct{}{},
+			})
+			return errors.New("code opérateur MongoDB invalide")
+		}
+		next[code] = struct{}{}
+	}
 
-        // Un résultat MongoDB valide mais vide reste une liste vide : deny all.
-        s.allowedOperators.Store(&operatorAllowlist{codes: next})
-        log.Printf("sécurité WS: autorisations opérateurs actualisées (%d actif(s))", len(next))
-        return nil
+	// Un résultat MongoDB valide mais vide reste une liste vide : deny all.
+	s.allowedOperators.Store(&operatorAllowlist{codes: next})
+	log.Printf("sécurité WS: autorisations opérateurs actualisées (%d actif(s))", len(next))
+	return nil
 }
 
 // runOperatorRefresh actualise périodiquement les autorisations.
 // Une panne MongoDB vide immédiatement le snapshot dans refreshAllowedOperators.
 func runOperatorRefresh(ctx context.Context, s *wsSecurityCfg, interval time.Duration) {
-        if interval <= 0 {
-                interval = 5 * time.Second
-        }
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
 
-        ticker := time.NewTicker(interval)
-        defer ticker.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-        for {
-                select {
-                case <-ctx.Done():
-                        return
-                case <-ticker.C:
-                        if err := refreshAllowedOperators(s); err != nil {
-                                log.Printf("sécurité WS: actualisation MongoDB impossible, tous les opérateurs refusés: %v", err)
-                        }
-                }
-        }
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := refreshAllowedOperators(s); err != nil {
+				log.Printf("sécurité WS: actualisation MongoDB impossible, tous les opérateurs refusés: %v", err)
+			}
+		}
+	}
 }
 
 func loadWSSecurity() *wsSecurityCfg {
-        c := &wsSecurityCfg{
-                allowedOrigins: map[string]struct{}{},
-                maxTTL:         24 * time.Hour,
-                maxConns:       5000,
-                maxBetUnits:    10_000_000,
-        }
+	c := &wsSecurityCfg{
+		allowedOrigins: map[string]struct{}{},
+		maxTTL:         24 * time.Hour,
+		maxConns:       5000,
+		maxBetUnits:    10_000_000,
+	}
 
-        // État initial : aucun opérateur autorisé avant confirmation MongoDB.
-        c.allowedOperators.Store(&operatorAllowlist{
-                codes: map[string]struct{}{},
-        })
+	// État initial : aucun opérateur autorisé avant confirmation MongoDB.
+	c.allowedOperators.Store(&operatorAllowlist{
+		codes: map[string]struct{}{},
+	})
 
-        for _, o := range wsSplitCSV(os.Getenv("ALLOWED_ORIGINS")) {
-                c.allowedOrigins[strings.ToLower(strings.TrimRight(o, "/"))] = struct{}{}
-        }
-        if len(c.allowedOrigins) == 0 {
-                log.Println("sécurité WS: ALLOWED_ORIGINS vide — toutes les origines navigateur sont acceptées")
-        }
+	for _, o := range wsSplitCSV(os.Getenv("ALLOWED_ORIGINS")) {
+		c.allowedOrigins[strings.ToLower(strings.TrimRight(o, "/"))] = struct{}{}
+	}
+	if len(c.allowedOrigins) == 0 {
+		log.Println("sécurité WS: ALLOWED_ORIGINS vide — toutes les origines navigateur sont acceptées")
+	}
 
-        if v := os.Getenv("JWT_MAX_TTL"); v != "" {
-                d, err := time.ParseDuration(v)
-                if err != nil || d <= 0 {
-                        log.Fatal("sécurité WS: JWT_MAX_TTL invalide")
-                }
-                c.maxTTL = d
-        }
+	if v := os.Getenv("JWT_MAX_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			log.Fatal("sécurité WS: JWT_MAX_TTL invalide")
+		}
+		c.maxTTL = d
+	}
 
-        if v := os.Getenv("WS_MAX_CONNS"); v != "" {
-                n, err := strconv.ParseInt(v, 10, 64)
-                if err != nil || n <= 0 {
-                        log.Fatal("sécurité WS: WS_MAX_CONNS invalide")
-                }
-                c.maxConns = n
-        }
+	if v := os.Getenv("WS_MAX_CONNS"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			log.Fatal("sécurité WS: WS_MAX_CONNS invalide")
+		}
+		c.maxConns = n
+	}
 
-        if v := os.Getenv("MAX_BET_UNITS"); v != "" {
-                f, err := strconv.ParseFloat(v, 64)
-                if err != nil || f <= 0 {
-                        log.Fatal("sécurité WS: MAX_BET_UNITS invalide")
-                }
-                c.maxBetUnits = f
-        }
+	if v := os.Getenv("MAX_BET_UNITS"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f <= 0 {
+			log.Fatal("sécurité WS: MAX_BET_UNITS invalide")
+		}
+		c.maxBetUnits = f
+	}
 
-        log.Printf("sécurité WS: origines=%d, ttl max=%s, conns max=%d, mise max=%.0f",
-                len(c.allowedOrigins), c.maxTTL, c.maxConns, c.maxBetUnits)
+	log.Printf("sécurité WS: origines=%d, ttl max=%s, conns max=%d, mise max=%.0f",
+		len(c.allowedOrigins), c.maxTTL, c.maxConns, c.maxBetUnits)
 
-        return c
+	return c
 }
 
 // wsCheckSecretStrength : avertit si JWT_SECRET < 32 octets ; fatal si APP_ENV=production.
@@ -240,12 +240,12 @@ func (s *wsSecurityCfg) validateToken(tokenStr string, secret []byte) (*wsClaims
 		return nil, errors.New("sub invalide")
 	}
 	snapshot := s.allowedOperators.Load()
-        if snapshot == nil {
-                return nil, errors.New("autorisations opérateur indisponibles")
-        }
-        if _, ok := snapshot.codes[claims.OperatorID]; !ok {
-                return nil, errors.New("operatorId non autorisé")
-        }
+	if snapshot == nil {
+		return nil, errors.New("autorisations opérateur indisponibles")
+	}
+	if _, ok := snapshot.codes[claims.OperatorID]; !ok {
+		return nil, errors.New("operatorId non autorisé")
+	}
 	exp, err := claims.GetExpirationTime()
 	if err != nil || exp == nil || time.Until(exp.Time) > s.maxTTL+wsClockLeeway {
 		return nil, errors.New("durée de validité excessive")

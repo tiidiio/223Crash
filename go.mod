@@ -1,4 +1,4 @@
-module github.com/tiidiio/223Gaming/223Crash
+module github.com/tiidiio/223Crash
 
 go 1.26.4
 
@@ -21,4 +21,4 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 )
 
-replace github.com/tiidiio/223Gaming => ../
+replace github.com/tiidiio/223Gaming => ../223Gaming

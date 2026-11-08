@@ -3,7 +3,7 @@ package main
 import (
 	"errors"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/game"
+	"github.com/tiidiio/223Crash/internal/game"
 )
 
 // errPanelOccupied : un nouveau betId a été présenté sur un panel qui porte déjà un pari en cours.

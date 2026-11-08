@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/security"
+	"github.com/tiidiio/223Crash/internal/security"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 

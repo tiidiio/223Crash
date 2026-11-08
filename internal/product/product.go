@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/version"
+	"github.com/tiidiio/223Crash/internal/version"
 )
 
 // ProductID représente un identifiant opaque de produit.

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/game"
+	"github.com/tiidiio/223Crash/internal/game"
 )
 
 var (

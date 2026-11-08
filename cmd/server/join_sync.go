@@ -1,6 +1,6 @@
 package main
 
-import "github.com/tiidiio/223Gaming/223Crash/internal/game"
+import "github.com/tiidiio/223Crash/internal/game"
 
 // syncRoundState aligne un client qui vient de se (re)connecter sur l'état courant du jeu.
 //

@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiidiio/223Gaming/provider/wallet"
 	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Gaming/provider/wallet"
 )
 
 var csErrInfra = errors.New("infra: boom")

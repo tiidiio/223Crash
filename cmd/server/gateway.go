@@ -15,11 +15,11 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
-	"github.com/tiidiio/223Gaming/223Crash/internal/game"
+	"github.com/tiidiio/223Crash/internal/engine"
+	"github.com/tiidiio/223Crash/internal/game"
 	"github.com/tiidiio/223Gaming/provider"
-	"github.com/tiidiio/223Gaming/provider/wallet"
 	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Gaming/provider/wallet"
 )
 
 // centimesPerUnit convertit l'unité majeure affichée au joueur (frontend, step=1)

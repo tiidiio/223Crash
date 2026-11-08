@@ -16,10 +16,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
-	"github.com/tiidiio/223Gaming/223Crash/internal/game"
-	"github.com/tiidiio/223Gaming/provider/wallet"
+	"github.com/tiidiio/223Crash/internal/engine"
+	"github.com/tiidiio/223Crash/internal/game"
 	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Gaming/provider/wallet"
 )
 
 // Tests d'intégration de handleBet : engine réel + Ledger sur MongoDB (MONGO_TEST_URI, base jetable
