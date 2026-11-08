@@ -128,12 +128,15 @@ func (c *client) writePump() {
 }
 
 type gateway struct {
-	eng          *engine.CrashEngine
+	eng          gameEngine
 	jwtSecret    []byte
-	walletClient *wallet.Client
-	walletQueue  *wallet.Queue
-	ledger       *ledger.Ledger
+	walletClient walletAPI
+	walletQueue  queueAPI
+	ledger       ledgerAPI
 	credits      *creditSettler
+
+	// refs relie chaque DEBIT confirmé à son pari moteur (placement idempotent, voir bet_refs.go).
+	refs betRefTable
 
 	mu      sync.RWMutex
 	clients map[string]*client // engineID (operatorID:playerID) -> client
@@ -390,6 +393,8 @@ func (gw *gateway) readPump(c *client) {
 //     jamais de second appel wallet.
 //     3. Le résultat déjà connu (CONFIRMED/FAILED) est utilisé pour répondre, sans jamais
 //     rejouer l'opération financière.
+//
+// Un rejeu (created == false) ne déclenche JAMAIS de remboursement : voir placeBetOrReuseEx.
 func (gw *gateway) handleBet(c *client, msg clientMessage) {
 	panel, ok := slotToPanel(msg.Slot)
 	if !ok {
@@ -423,6 +428,16 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 	round, err := gw.eng.CurrentRound()
 	if err != nil {
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "aucun round actif"}})
+		return
+	}
+
+	// Contrôle de phase AVANT tout accès Ledger/wallet : hors fenêtre de mises, aucun mouvement
+	// d'argent n'est ouvert (ni DEBIT, ni ROLLBACK compensatoire). CREATED est toléré : le moteur
+	// ouvre les mises du BetManager juste avant de basculer l'état du round. La validation côté
+	// moteur (PlaceBet) reste l'arbitre final pour les courses de fermeture.
+	if round.State != game.StateCreated && round.State != game.StateBettingOpen {
+		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "paris fermés"}})
+		gw.announceExistingBet(c, panel, msg.Slot)
 		return
 	}
 
@@ -576,55 +591,83 @@ func (gw *gateway) waitForLedgerResolution(ctx context.Context, txnID ledger.Tra
 	}
 }
 
-// placeBetOrReuse engage le pari côté engine après un DEBIT confirmé (nouveau ou retrouvé via
-// idempotency). BetManager.PlaceBet est protégé par son propre mutex et rejette tout second pari
-// sur un panel déjà occupé (game.ErrBetAlreadyExists) — c'est ce mécanisme, pas un lock côté
-// gateway, qui garantit qu'un DEBIT confirmé ne produit jamais deux paris engine même si
-// plusieurs goroutines (créateur + retries concurrents résolus) appellent PlaceBet en parallèle
-// pour le même betId : une seule gagne, les autres retrouvent le pari existant et le renvoient
-// tel quel — aucune nouvelle opération financière n'est déclenchée dans les deux cas.
+// betRejectReason convertit une erreur interne en raison affichable : jamais d'err.Error() brut
+// vers le client.
+func betRejectReason(err error) string {
+	switch {
+	case errors.Is(err, errPanelOccupied), errors.Is(err, game.ErrBetAlreadyExists):
+		return errPanelOccupied.Error()
+	case errors.Is(err, game.ErrBettingClosed), errors.Is(err, game.ErrNoActiveRound), errors.Is(err, game.ErrRoundNotRunning):
+		return "paris fermés"
+	default:
+		return "pari non accepté"
+	}
+}
+
+// placeBetOrReuse engage le pari côté engine après un DEBIT confirmé retrouvé via l'idempotence
+// (rejeu, fresh == false).
 func (gw *gateway) placeBetOrReuse(c *client, msg clientMessage, panel game.BetPanel, amount int64, cashoutTarget float64, round *game.Round, debitEntry *ledger.Entry) {
-	// Chemin d'un retry : DEBIT retrouvé via l'idempotence, un pari existant est légitime.
 	gw.placeBetOrReuseEx(c, msg, panel, amount, cashoutTarget, round, debitEntry, false)
 }
 
-// placeBetOrReuseEx : fresh == true signifie que ce DEBIT vient d'être créé par cet appel (nouveau betId).
-// ErrBetAlreadyExists désigne alors forcément le pari d'un AUTRE betId : le débit doit être remboursé.
+// placeBetOrReuseEx engage le pari côté engine après un DEBIT confirmé.
+//
+// Le placement est idempotent par DEBIT (betRefTable, clé = TransactionID) : le créateur du débit
+// et ses rejeux concurrents obtiennent le même pari, jamais deux.
+//
+// fresh == true : ce DEBIT vient d'être créé par cet appel. Si le placement échoue, le débit ne
+// correspond à aucun pari : remboursement via rollbackConfirmedDebit.
+//
+// fresh == false : rejeu d'un DEBIT historique confirmé. Un échec de placement (phase fermée,
+// round terminé, panel pris…) ne justifie JAMAIS un remboursement automatique : le pari peut être
+// vivant ou déjà perdu. Le cas est journalisé en CRITIQUE pour réconciliation, rien d'autre
+// n'est déclenché côté argent.
 func (gw *gateway) placeBetOrReuseEx(c *client, msg clientMessage, panel game.BetPanel, amount int64, cashoutTarget float64, round *game.Round, debitEntry *ledger.Entry, fresh bool) {
-	bet, err := gw.eng.PlaceBet(c.engineID(), panel, amount, cashoutTarget)
-	if err != nil {
-		if errors.Is(err, game.ErrBetAlreadyExists) {
-			// Nouveau DEBIT sur un panel déjà occupé (course avec le contrôle de handleBet) : ce débit ne
-			// correspond à aucun pari. Remboursement, puis resynchronisation sur le pari réel.
-			if fresh {
-				gw.rollbackConfirmedDebit(c, msg, amount, round, debitEntry, errPanelOccupied)
-				gw.announceExistingBet(c, panel, msg.Slot)
-				return
-			}
-			existing, getErr := gw.eng.GetPanelBet(c.engineID(), panel)
-			if getErr != nil {
-				// Incohérence transitoire (ex. le round a été réglé entre les deux lectures) : le
-				// DEBIT reste confirmé et sain, rien à rembourser — on informe seulement le client.
-				log.Printf("gateway: pari existant introuvable après ErrBetAlreadyExists player=%s panel=%s betId=%s: %v", c.playerID, panel, msg.BetID, getErr)
-				c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "pari déjà traité"}})
-				return
-			}
-			b := existing
-			c.mu.Lock()
-			c.activeBets[panel] = &b
-			c.mu.Unlock()
-			c.sendJSON(map[string]any{"type": "BET_ACCEPTED", "data": map[string]any{"slot": msg.Slot}})
+	bet, err := gw.refs.placeOnce(gw.eng, round.ID, string(debitEntry.TransactionID), c.engineID(), panel, amount, cashoutTarget)
+	if err == nil {
+		if bet.State != game.BetPending {
+			// Rejeu d'un pari déjà réglé (encaissé ou perdu) : rien à réactiver ni à rembourser.
+			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "pari déjà réglé"}})
 			return
 		}
-
-		gw.rollbackConfirmedDebit(c, msg, amount, round, debitEntry, err)
+		b := bet
+		c.mu.Lock()
+		c.activeBets[panel] = &b
+		c.mu.Unlock()
+		c.sendJSON(map[string]any{"type": "BET_ACCEPTED", "data": map[string]any{"slot": msg.Slot}})
 		return
 	}
 
-	c.mu.Lock()
-	c.activeBets[panel] = bet
-	c.mu.Unlock()
-	c.sendJSON(map[string]any{"type": "BET_ACCEPTED", "data": map[string]any{"slot": msg.Slot}})
+	if errors.Is(err, errBetRefStale) {
+		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "pari déjà traité"}})
+		return
+	}
+
+	if !fresh {
+		gw.reportUnplacedDebit(c, msg, debitEntry, err)
+		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": betRejectReason(err)}})
+		if errors.Is(err, game.ErrBetAlreadyExists) {
+			gw.announceExistingBet(c, panel, msg.Slot)
+		}
+		return
+	}
+
+	if errors.Is(err, game.ErrBetAlreadyExists) {
+		// Nouveau DEBIT sur un panel déjà occupé par un AUTRE pari (course avec le contrôle de
+		// handleBet) : ce débit ne correspond à aucun pari. Remboursement, puis resynchronisation.
+		gw.rollbackConfirmedDebit(c, msg, amount, round, debitEntry, errPanelOccupied)
+		gw.announceExistingBet(c, panel, msg.Slot)
+		return
+	}
+
+	gw.rollbackConfirmedDebit(c, msg, amount, round, debitEntry, err)
+}
+
+// reportUnplacedDebit trace un DEBIT confirmé rejoué sans pari engine retrouvable. Aucune action
+// financière automatique : tous les champs nécessaires à une réconciliation manuelle sont logués.
+func (gw *gateway) reportUnplacedDebit(c *client, msg clientMessage, debit *ledger.Entry, cause error) {
+	log.Printf("gateway: CRITIQUE rejeu d'un DEBIT confirmé sans pari engine, AUCUN remboursement automatique txn=%s op=%s player=%s betId=%s amount=%d ref=%s: %v",
+		debit.TransactionID, c.operatorID, c.playerID, msg.BetID, debit.AmountMinor, debit.ExternalRef, cause)
 }
 
 // rollbackConfirmedDebit rembourse un DEBIT déjà CONFIRMED lorsque PlaceBet échoue pour une
@@ -633,7 +676,7 @@ func (gw *gateway) placeBetOrReuseEx(c *client, msg clientMessage, panel game.Be
 // (ParentTransactionID = TransactionID du DEBIT), jamais une réécriture du DEBIT existant — la
 // chaîne comptable DEBIT → ROLLBACK reste auditable. Asynchrone via la Queue, idempotent au même
 // titre que le DEBIT (clé scopée operator/player/transactionId, jamais réutilisable pour un
-// autre DEBIT).
+// autre DEBIT). Réservé aux débits NEUFS (fresh == true).
 func (gw *gateway) rollbackConfirmedDebit(c *client, msg clientMessage, amount int64, round *game.Round, debitEntry *ledger.Entry, placeErr error) {
 	idemKey := fmt.Sprintf("rollback:%s:%s:%s", c.operatorID, c.playerID, debitEntry.TransactionID)
 	rollbackEntry, _, rbErr := gw.ledger.Begin(context.Background(), ledger.NewEntry{
@@ -668,7 +711,7 @@ func (gw *gateway) rollbackConfirmedDebit(c *client, msg clientMessage, amount i
 		log.Printf("wallet: enqueue ROLLBACK txn=%s: %v", debitEntry.TransactionID, qErr)
 	}
 	gw.refreshBalance(c, 800*time.Millisecond, 3*time.Second)
-	c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": placeErr.Error()}})
+	c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": betRejectReason(placeErr)}})
 }
 
 func (gw *gateway) handleCashout(c *client, msg clientMessage) {
