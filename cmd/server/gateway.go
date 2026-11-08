@@ -15,6 +15,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 
+	"github.com/tiidiio/223Crash/internal/betstore"
 	"github.com/tiidiio/223Crash/internal/engine"
 	"github.com/tiidiio/223Crash/internal/game"
 	"github.com/tiidiio/223Gaming/provider"
@@ -140,6 +141,11 @@ type gateway struct {
 	rb     *rollbackSettler
 	rbOnce sync.Once
 
+	// bets est le store durable des paris (voir bet_persist.go). nil = persistance désactivée
+	// (comportement historique, tests). instanceID identifie ce processus dans les documents.
+	bets       betstore.VoidStore
+	instanceID string
+
 	// refs relie chaque DEBIT confirmé à son pari moteur (placement idempotent, voir bet_refs.go).
 	refs betRefTable
 
@@ -206,18 +212,32 @@ func (gw *gateway) broadcast(msgType string, data map[string]any) {
 // bet.Payout est en centimes (même unité que le DEBIT initial) — reconverti en unité
 // majeure uniquement pour l'affichage client (CASHOUT_ACCEPTED).
 //
-// Le règlement du gain est délégué à creditSettler (credit_settle.go) : l'entrée Ledger
+// Avec la persistance active, l'encaissement est d'abord enregistré durablement
+// (persistCashout) : sur conflit d'état (pari LOST, RECONCILING, VOIDED…) aucun crédit n'est
+// émis. L'identifiant utilisé dans la clé du CREDIT est alors le TransactionID du DEBIT (unique
+// globalement), jamais l'ID moteur "bet-N" qui repart de 0 à chaque processus.
+//
+// Le règlement du gain est ensuite délégué à creditSettler (credit_settle.go) : l'entrée Ledger
 // EntryCredit est ouverte AVANT tout envoi, aucun callback CREDIT ne part sans TransactionID,
 // seul le créateur de l'entrée enfile le callback (pas de double envoi), et un échec de Begin ou
 // d'Enqueue reste récupérable (reprise en arrière-plan / Provider Recovery). Les appels sont
 // bornés dans le temps : cette méthode est aussi appelée depuis la boucle de ticks (auto-cashout).
 func (gw *gateway) settleCashout(c *client, bet *game.Bet) {
+	creditBetID, ok := gw.persistCashout(c, bet)
+	if !ok {
+		c.mu.Lock()
+		delete(c.activeBets, bet.Panel)
+		c.mu.Unlock()
+		c.sendJSON(map[string]any{"type": "CASHOUT_REJECTED", "data": map[string]any{"slot": panelToSlot(bet.Panel), "reason": "à vérifier"}})
+		return
+	}
+
 	if bet.Payout > 0 {
 		gw.credits.Settle(creditRequest{
 			OperatorID:  c.operatorID,
 			PlayerID:    c.playerID,
 			RoundID:     bet.RoundID,
-			BetID:       bet.ID,
+			BetID:       creditBetID,
 			AmountMinor: bet.Payout,
 		})
 	}
@@ -269,8 +289,11 @@ func (gw *gateway) checkAutoCashout(currentMultiplier float64) {
 
 // notifyLostBets force le reset visuel du panel côté frontend (data-active) pour les paris
 // perdants — aucune action wallet : le joueur a déjà été débité au moment du pari, la perte
-// est déjà actée côté opérateur, un CRASH n'est pas un événement wallet.
+// est déjà actée côté opérateur, un CRASH n'est pas un événement wallet. Les paris perdus sont
+// enregistrés durablement (persistLost), y compris pour les joueurs déconnectés.
 func (gw *gateway) notifyLostBets(lost []game.Bet) {
+	gw.persistLost(lost)
+
 	gw.mu.RLock()
 	defer gw.mu.RUnlock()
 	for _, bet := range lost {
@@ -632,17 +655,27 @@ func (gw *gateway) placeBetOrReuse(c *client, msg clientMessage, panel game.BetP
 
 // placeBetOrReuseEx engage le pari côté engine après un DEBIT confirmé.
 //
+// Avec la persistance active, le document durable du pari est créé (ou retrouvé) AVANT le
+// placement (persistNewBet) : sans document valide et PENDING pour cette instance, aucun pari
+// n'est placé.
+//
 // Le placement est idempotent par DEBIT (betRefTable, clé = TransactionID) : le créateur du débit
 // et ses rejeux concurrents obtiennent le même pari, jamais deux.
 //
 // fresh == true : ce DEBIT vient d'être créé par cet appel. Si le placement échoue, le débit ne
-// correspond à aucun pari : remboursement via rollbackConfirmedDebit.
+// correspond à aucun pari : le document est annulé (VOIDED) puis remboursement via
+// rollbackConfirmedDebit.
 //
 // fresh == false : rejeu d'un DEBIT historique confirmé. Un échec de placement (phase fermée,
 // round terminé, panel pris…) ne justifie JAMAIS un remboursement automatique : le pari peut être
-// vivant ou déjà perdu. Le cas est journalisé en CRITIQUE pour réconciliation, rien d'autre
-// n'est déclenché côté argent.
+// vivant ou déjà perdu. Le document passe en RECONCILING et le cas est journalisé en CRITIQUE ;
+// rien d'autre n'est déclenché côté argent.
 func (gw *gateway) placeBetOrReuseEx(c *client, msg clientMessage, panel game.BetPanel, amount int64, cashoutTarget float64, round *game.Round, debitEntry *ledger.Entry, fresh bool) {
+	if perr := gw.persistNewBet(c, msg, panel, amount, cashoutTarget, round, debitEntry); perr != nil {
+		gw.onPersistFailure(c, msg, amount, round, debitEntry, fresh, perr)
+		return
+	}
+
 	bet, err := gw.refs.placeOnce(gw.eng, round.ID, string(debitEntry.TransactionID), c.engineID(), panel, amount, cashoutTarget)
 	if err == nil {
 		if bet.State != game.BetPending {
@@ -650,6 +683,7 @@ func (gw *gateway) placeBetOrReuseEx(c *client, msg clientMessage, panel game.Be
 			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "pari déjà réglé"}})
 			return
 		}
+		gw.refs.remember(round.ID, bet.ID, string(debitEntry.TransactionID), c.operatorID)
 		b := bet
 		c.mu.Lock()
 		c.activeBets[panel] = &b
@@ -664,6 +698,7 @@ func (gw *gateway) placeBetOrReuseEx(c *client, msg clientMessage, panel game.Be
 	}
 
 	if !fresh {
+		gw.reconcileUnplaced(debitEntry, "rejeu : placement impossible ("+err.Error()+")")
 		gw.reportUnplacedDebit(c, msg, debitEntry, err)
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": betRejectReason(err)}})
 		if errors.Is(err, game.ErrBetAlreadyExists) {
@@ -671,6 +706,8 @@ func (gw *gateway) placeBetOrReuseEx(c *client, msg clientMessage, panel game.Be
 		}
 		return
 	}
+
+	gw.voidBet(debitEntry, "aucun pari placé, débit remboursé : "+err.Error())
 
 	if errors.Is(err, game.ErrBetAlreadyExists) {
 		// Nouveau DEBIT sur un panel déjà occupé par un AUTRE pari (course avec le contrôle de

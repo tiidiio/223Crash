@@ -12,17 +12,26 @@ import (
 // jamais depuis un rejeu.
 var errBetRefStale = errors.New("gateway: pari associé à ce débit introuvable")
 
+// betRef relie un pari moteur (ID local au processus, "bet-N") à son identité durable : le
+// TransactionID du DEBIT et l'opérateur. C'est ce lien qui permet au cashout et au crash de
+// retrouver le document durable du pari.
+type betRef struct {
+	txn        string
+	operatorID string
+}
+
 // betRefTable relie la référence d'un DEBIT confirmé (TransactionID du Ledger) au pari moteur
 // qu'il a produit, pour le round courant. Elle rend le placement idempotent : le créateur du
 // débit et ses rejeux concurrents obtiennent le MÊME pari, jamais deux, et un rejeu retrouve son
 // pari au lieu de retenter un placement (donc sans risque de remboursement indu).
 //
 // L'état est volontairement local au processus, comme les paris du moteur. Il est remis à zéro
-// à chaque changement de round.
+// à chaque changement de round. La vérité durable est dans internal/betstore.
 type betRefTable struct {
 	mu      sync.Mutex
 	roundID string
-	byRef   map[string]string
+	byRef   map[string]string // TransactionID -> ID du pari moteur
+	byBet   map[string]betRef // ID du pari moteur -> identité durable
 }
 
 // placeOnce place le pari au plus une fois par ref. Le verrou couvre le test et le placement :
@@ -34,6 +43,7 @@ func (t *betRefTable) placeOnce(eng gameEngine, roundID, ref, engineID string, p
 	if t.byRef == nil || t.roundID != roundID {
 		t.roundID = roundID
 		t.byRef = make(map[string]string)
+		t.byBet = make(map[string]betRef)
 	}
 
 	if betID, known := t.byRef[ref]; known {
@@ -51,4 +61,25 @@ func (t *betRefTable) placeOnce(eng gameEngine, roundID, ref, engineID string, p
 	}
 	t.byRef[ref] = bet.ID
 	return *bet, nil
+}
+
+// remember enregistre l'identité durable d'un pari placé. Sans effet si le round a changé.
+func (t *betRefTable) remember(roundID, engineBetID, txn, operatorID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.roundID != roundID {
+		return
+	}
+	if t.byBet == nil {
+		t.byBet = make(map[string]betRef)
+	}
+	t.byBet[engineBetID] = betRef{txn: txn, operatorID: operatorID}
+}
+
+// lookup retrouve l'identité durable d'un pari moteur du round courant.
+func (t *betRefTable) lookup(engineBetID string) (betRef, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r, ok := t.byBet[engineBetID]
+	return r, ok
 }

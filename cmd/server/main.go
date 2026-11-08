@@ -14,6 +14,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/tiidiio/223Crash/internal/admin"
+	"github.com/tiidiio/223Crash/internal/betstore"
 	"github.com/tiidiio/223Crash/internal/engine"
 	"github.com/tiidiio/223Crash/internal/mongobridge"
 	"github.com/tiidiio/223Gaming/provider/ledger"
@@ -99,6 +100,16 @@ func main() {
 	}
 
 	gw := newGateway(eng, jwtSecret, walletClient, walletQueue, provLedger)
+
+	// Persistance durable des paris (collection crash_bets, créée à la demande). Activée AVANT le
+	// démarrage du moteur et des serveurs : aucun pari n'est accepté sans elle.
+	betStore, err := betstore.NewMongo(ctx, store.DB)
+	if err != nil {
+		log.Fatalf("bet store: %v", err)
+	}
+	if err := gw.enableBetPersistence(ctx, betStore, newInstanceID(), orphanGrace); err != nil {
+		log.Fatalf("bet persistence: %v", err)
+	}
 
 	go func() {
 		if err := eng.Run(ctx); err != nil && ctx.Err() == nil {
