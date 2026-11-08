@@ -45,7 +45,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := mongobridge.NewStore(ctx, mongoURI, mongoDB)
+	// Initialisation MongoDB limitée à 15 secondes.
+	initCtx, cancelInit := context.WithTimeout(ctx, 15*time.Second)
+	store, err := mongobridge.NewStore(initCtx, mongoURI, mongoDB)
+	cancelInit()
 	if err != nil {
 		log.Fatalf("mongobridge: %v", err)
 	}
@@ -109,21 +112,27 @@ func main() {
 	static.Handle("/api/admin/", admin.NewHandler(adminStore))
 	registerProviderConsole(static)
 	static.HandleFunc("/", serveStatic)
+
 	static.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
 		mongoStatus := "connected"
-		httpStatus := http.StatusOK
 		if err := store.Ping(pingCtx); err != nil {
 			mongoStatus = "down"
-			httpStatus = http.StatusServiceUnavailable
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(httpStatus)
-		json.NewEncoder(w).Encode(healthResponse{Status: "ok", Mongo: mongoStatus})
+		w.WriteHeader(http.StatusOK)
+
+		if err := json.NewEncoder(w).Encode(healthResponse{
+			Status: "ok",
+			Mongo:  mongoStatus,
+		}); err != nil {
+			log.Printf("healthz: erreur JSON: %v", err)
+		}
 	})
+
 	go serve(ctx, httpPort, static, "static")
 
 	wsMux := http.NewServeMux()
@@ -168,12 +177,14 @@ func serve(ctx context.Context, port string, mux http.Handler, name string) {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
+
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		srv.Shutdown(shutdownCtx)
 	}()
+
 	log.Printf("%s: écoute sur :%s", name, port)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("%s: %v", name, err)
