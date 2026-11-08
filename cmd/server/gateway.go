@@ -17,9 +17,9 @@ import (
 
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/game"
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider"
-	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
-	"github.com/tiidiio/223Gaming/internal/provider/ledger"
+	"github.com/tiidiio/223Gaming/provider"
+	"github.com/tiidiio/223Gaming/provider/wallet"
+	"github.com/tiidiio/223Gaming/provider/ledger"
 )
 
 // centimesPerUnit convertit l'unité majeure affichée au joueur (frontend, step=1)

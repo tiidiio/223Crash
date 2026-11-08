@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/tiidiio/223Gaming/223Crash/internal/game"
-	"github.com/tiidiio/223Gaming/internal/provider/ledger"
+	"github.com/tiidiio/223Gaming/provider/ledger"
 )
 
 func refundKey(debit *ledger.Entry) ledger.IdempotencyKey {

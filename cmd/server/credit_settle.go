@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider"
-	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
-	"github.com/tiidiio/223Gaming/internal/provider/ledger"
+	"github.com/tiidiio/223Gaming/provider"
+	"github.com/tiidiio/223Gaming/provider/wallet"
+	"github.com/tiidiio/223Gaming/provider/ledger"
 )
 
 // Règlement d'un gain (CREDIT) après cashout.

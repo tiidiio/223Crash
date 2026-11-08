@@ -16,9 +16,9 @@ import (
 	"github.com/tiidiio/223Gaming/223Crash/internal/admin"
 	"github.com/tiidiio/223Gaming/223Crash/internal/engine"
 	"github.com/tiidiio/223Gaming/223Crash/internal/mongobridge"
-	"github.com/tiidiio/223Gaming/223Crash/internal/provider/recovery"
-	"github.com/tiidiio/223Gaming/223Crash/internal/wallet"
-	"github.com/tiidiio/223Gaming/internal/provider/ledger"
+	"github.com/tiidiio/223Gaming/provider/recovery"
+	"github.com/tiidiio/223Gaming/provider/wallet"
+	"github.com/tiidiio/223Gaming/provider/ledger"
 )
 
 type healthResponse struct {
