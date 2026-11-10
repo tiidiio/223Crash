@@ -28,6 +28,8 @@ var betIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
 
 func validBetID(id string) bool { return betIDPattern.MatchString(id) }
 
+var errBetAlreadyExists = errors.New("bet already exists")
+
 type wsClaims struct {
 	OperatorID string `json:"operatorId"`
 	jwt.RegisteredClaims
@@ -53,11 +55,17 @@ type client struct {
 
 func (c *client) sendJSON(v any) {
 	b, err := json.Marshal(v)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	c.trySend(b)
 }
 func (c *client) trySend(b []byte) {
-	select { case <-c.done: return; default: }
+	select {
+	case <-c.done:
+		return
+	default:
+	}
 	select {
 	case c.send <- b:
 	case <-c.done:
@@ -88,26 +96,33 @@ func (c *client) writePump() {
 }
 
 type gateway struct {
+	panelGuard   *panelGuard
 	eng          v1.GameEngine
 	jwtSecret    []byte
 	walletClient *wallet.Client
 	walletQueue  *wallet.Queue
 	ledger       *ledger.Ledger
 	credits      *creditSettler
+	betStore     BetStore
 	mu           sync.RWMutex
 	clients      map[string]*client
 	shutting     atomic.Bool
 	shutdownOnce sync.Once
 }
 
-func newGateway(eng v1.GameEngine, jwtSecret string, walletClient *wallet.Client, walletQueue *wallet.Queue, ldg *ledger.Ledger) *gateway {
+func newGateway(eng v1.GameEngine, jwtSecret string, walletClient *wallet.Client, walletQueue *wallet.Queue, ldg *ledger.Ledger, betStore BetStore) *gateway {
+	if betStore == nil {
+		betStore = NewMemBetStore()
+	}
 	return &gateway{
+		panelGuard:   newPanelGuard(),
 		eng:          eng,
 		jwtSecret:    []byte(jwtSecret),
 		walletClient: walletClient,
 		walletQueue:  walletQueue,
 		ledger:       ldg,
-		credits:      newCreditSettler(ldg, walletQueue, product.GameID),
+		credits:      newCreditSettler(ldg, walletQueue, string(product.GameID)),
+		betStore:     betStore,
 		clients:      make(map[string]*client),
 	}
 }
@@ -134,14 +149,22 @@ func (gw *gateway) unregister(c *client) {
 	}
 	gw.mu.Unlock()
 	c.closeOnce.Do(func() { close(c.done) })
+	// libère tous les locks panels de ce user
+	if gw.panelGuard != nil {
+		gw.panelGuard.UnlockAll(c.engineID())
+	}
 }
 func (gw *gateway) Shutdown() {
 	gw.shutdownOnce.Do(func() {
 		gw.mu.Lock()
 		gw.shutting.Store(true)
 		snapshot := make([]*client, 0, len(gw.clients))
-		for _, c := range gw.clients { snapshot = append(snapshot, c) }
-		for k := range gw.clients { delete(gw.clients, k) }
+		for _, c := range gw.clients {
+			snapshot = append(snapshot, c)
+		}
+		for k := range gw.clients {
+			delete(gw.clients, k)
+		}
 		gw.mu.Unlock()
 		for _, c := range snapshot {
 			if c.conn != nil {
@@ -156,45 +179,77 @@ func (gw *gateway) Shutdown() {
 func (gw *gateway) Broadcast(msgType string, data map[string]any) {
 	payload := map[string]any{"type": msgType, "data": data}
 	b, err := json.Marshal(payload)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	gw.mu.RLock()
 	defer gw.mu.RUnlock()
-	for _, c := range gw.clients { c.trySend(b) }
+	for _, c := range gw.clients {
+		c.trySend(b)
+	}
 }
 func (gw *gateway) broadcast(msgType string, data map[string]any) { gw.Broadcast(msgType, data) }
 
-func (gw *gateway) CheckAutoCashout(multiplier float64) { gw.checkAutoCashout(multiplier) }
-
+// FIX BUG 1 : crédit basé sur debitTxnID, pas betID
 func (gw *gateway) settleCashout(c *client, bet v1.BetView) {
-	if bet.Payout > 0 {
-		gw.credits.Settle(creditRequest{OperatorID: c.operatorID, PlayerID: c.playerID, RoundID: bet.RoundID, BetID: bet.ID, AmountMinor: bet.Payout})
+	if bet.Payout <= 0 {
+		return
+	}
+	// Récupère debitTxnID persistant
+	debitTxnID, ok := gw.betStore.GetDebitTxnID(bet.ID)
+	if !ok {
+		// fallback si redémarrage sans persistance : utilise bet.ID mais log critique
+		log.Printf("settleCashout: CRITIQUE betStore miss betID=%s, fallback betID (risque collision après restart)", bet.ID)
+	}
+	// Crédit idempotent par debitTxnID
+	if ok {
+		gw.credits.SettleWithDebitTxn(creditRequest{
+			OperatorID: c.operatorID, PlayerID: c.playerID,
+			RoundID: bet.RoundID, BetID: bet.ID, AmountMinor: bet.Payout,
+			DebitTxnID: debitTxnID,
+		})
+	} else {
+		gw.credits.Settle(creditRequest{
+			OperatorID: c.operatorID, PlayerID: c.playerID,
+			RoundID: bet.RoundID, BetID: bet.ID, AmountMinor: bet.Payout,
+		})
 	}
 	c.mu.Lock()
 	delete(c.activeBets, bet.Panel)
-	c.mu.Unlock()
-	if bet.Payout > 0 {
-		gw.refreshBalance(c, 500*time.Millisecond, 2*time.Second, 5*time.Second)
+	if gw.panelGuard != nil {
+		gw.panelGuard.Unlock(bet.UserID, bet.Panel)
+		gw.panelGuard.Unlock(c.engineID(), bet.Panel)
 	}
+	c.mu.Unlock()
+	gw.refreshBalance(c, 500*time.Millisecond, 2*time.Second, 5*time.Second)
 	c.sendJSON(map[string]any{"type": "CASHOUT_ACCEPTED", "data": map[string]any{"slot": product.PanelToSlot(bet.Panel), "payout": product.ToUnits(bet.Payout)}})
 }
 
+func (gw *gateway) CheckAutoCashout(multiplier float64) { gw.checkAutoCashout(multiplier) }
+
 func (gw *gateway) checkAutoCashout(currentMultiplier float64) {
+	// L'auto-cashout est désormais géré par le moteur (EventAutoCashout), plus ici
+	// Gardé pour compat si besoin
 	gw.mu.RLock()
-	clientsSnapshot := make([]*client, 0, len(gw.clients))
-	for _, c := range gw.clients { clientsSnapshot = append(clientsSnapshot, c) }
+	snapshot := make([]*client, 0, len(gw.clients))
+	for _, c := range gw.clients {
+		snapshot = append(snapshot, c)
+	}
 	gw.mu.RUnlock()
-	for _, c := range clientsSnapshot {
+	for _, c := range snapshot {
 		c.mu.Lock()
 		var toCashout []v1.BetView
 		for _, bet := range c.activeBets {
-			if bet != nil && bet.CashoutTarget <= currentMultiplier && bet.CashoutTarget > 0 {
+			if bet != nil && bet.CashoutTarget <= currentMultiplier && bet.CashoutTarget > 0 && bet.CashoutTarget < noAutoCashoutSentinel {
 				toCashout = append(toCashout, *bet)
 			}
 		}
 		c.mu.Unlock()
 		for _, bet := range toCashout {
 			settled, err := gw.eng.Cashout(bet.ID)
-			if err != nil { continue }
+			if err != nil {
+				continue
+			}
 			gw.settleCashout(c, settled)
 		}
 	}
@@ -207,9 +262,25 @@ func (gw *gateway) notifyLostBets(lost []v1.BetView) {
 	defer gw.mu.RUnlock()
 	for _, bet := range lost {
 		c, ok := gw.clients[bet.UserID]
-		if !ok { continue }
+		if !ok {
+			// cherche aussi par engineID
+			for _, cc := range gw.clients {
+				if cc.engineID() == bet.UserID {
+					c = cc
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok {
+			continue
+		}
 		c.mu.Lock()
 		delete(c.activeBets, bet.Panel)
+		if gw.panelGuard != nil {
+			gw.panelGuard.Unlock(bet.UserID, bet.Panel)
+			gw.panelGuard.Unlock(c.engineID(), bet.Panel)
+		}
 		c.mu.Unlock()
 		c.sendJSON(map[string]any{"type": "CASHOUT_REJECTED", "data": map[string]any{"slot": product.PanelToSlot(bet.Panel), "reason": "round_crashed"}})
 	}
@@ -280,7 +351,7 @@ func (gw *gateway) readPump(c *client) {
 		wsSecurity().release()
 	}()
 	wsConfigureConn(c.conn)
-	log.Printf("ws: connecté player=%s", c.playerID)
+	log.Printf("ws: connecté player=%s op=%s", c.playerID, c.operatorID)
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
@@ -295,7 +366,9 @@ func (gw *gateway) readPump(c *client) {
 			continue
 		}
 		var msg clientMessage
-		if err := json.Unmarshal(raw, &msg); err != nil { continue }
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			continue
+		}
 		switch msg.Action {
 		case "join":
 			balCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -339,8 +412,21 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "montant invalide"}})
 		return
 	}
+
+	// FIX 2-panel V2 : TryLock AVANT tout DEBIT
+	if gw.panelGuard != nil {
+		if !gw.panelGuard.TryLock(c.engineID(), panel) {
+			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": errPanelOccupied.Error()}})
+			gw.announceExistingBet(c, panel, msg.Slot)
+			return
+		}
+	}
+
 	round, err := gw.eng.CurrentRound()
 	if err != nil {
+		if gw.panelGuard != nil {
+			gw.panelGuard.Unlock(c.engineID(), panel)
+		}
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "aucun round actif"}})
 		return
 	}
@@ -348,6 +434,9 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 	if msg.AutoCashout != nil {
 		t := *msg.AutoCashout
 		if math.IsNaN(t) || math.IsInf(t, 0) || t < wsMinAutoCashout || t > wsMaxAutoCashout {
+			if gw.panelGuard != nil {
+				gw.panelGuard.Unlock(c.engineID(), panel)
+			}
 			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "autoCashout invalide"}})
 			return
 		}
@@ -368,11 +457,17 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 	})
 	if err != nil {
 		log.Printf("ledger: begin debit betId=%s: %v", msg.BetID, err)
+		if gw.panelGuard != nil {
+			gw.panelGuard.Unlock(c.engineID(), panel)
+		}
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "service indisponible"}})
 		return
 	}
 	if !created {
 		if debitEntry.ExternalRef != externalRef {
+			if gw.panelGuard != nil {
+				gw.panelGuard.Unlock(c.engineID(), panel)
+			}
 			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "betId déjà utilisé avec des paramètres différents"}})
 			return
 		}
@@ -381,18 +476,29 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 			resolved, err = gw.waitForLedgerResolution(opCtx, debitEntry.TransactionID)
 			if err != nil {
 				log.Printf("ledger: attente résolution betId=%s txn=%s: %v", msg.BetID, debitEntry.TransactionID, err)
+				if gw.panelGuard != nil {
+					gw.panelGuard.Unlock(c.engineID(), panel)
+				}
 				c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "débit en cours de traitement, réessayez"}})
 				return
 			}
 		}
 		switch resolved.Status {
 		case ledger.StatusFailed:
+			if gw.panelGuard != nil {
+				gw.panelGuard.Unlock(c.engineID(), panel)
+			}
 			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "débit refusé"}})
 			return
 		case ledger.StatusConfirmed:
 			if refunded, chkErr := gw.debitMarkedForRefund(c, resolved); chkErr != nil || refunded {
 				reason := "débit annulé"
-				if chkErr != nil { reason = "service indisponible, réessayez" }
+				if chkErr != nil {
+					reason = "service indisponible, réessayez"
+				}
+				if gw.panelGuard != nil {
+					gw.panelGuard.Unlock(c.engineID(), panel)
+				}
 				c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": reason}})
 				return
 			}
@@ -401,13 +507,20 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 			return
 		default:
 			log.Printf("ledger: statut inattendu après résolution betId=%s txn=%s status=%s", msg.BetID, resolved.TransactionID, resolved.Status)
+			if gw.panelGuard != nil {
+				gw.panelGuard.Unlock(c.engineID(), panel)
+			}
 			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "état de débit incohérent"}})
 			return
 		}
 	}
+	// double check panel après ledger (race)
 	if _, ok, _ := gw.eng.GetPanelBet(c.engineID(), panel); ok {
 		if _, fErr := gw.ledger.Fail(opCtx, debitEntry.TransactionID, "panel occupé"); fErr != nil {
 			log.Printf("ledger: fail debit (panel occupé) txn=%s: %v", debitEntry.TransactionID, fErr)
+		}
+		if gw.panelGuard != nil {
+			gw.panelGuard.Unlock(c.engineID(), panel)
 		}
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": errPanelOccupied.Error()}})
 		gw.announceExistingBet(c, panel, msg.Slot)
@@ -427,14 +540,22 @@ func (gw *gateway) handleBet(c *client, msg clientMessage) {
 		gw.placeBetOrReuseEx(c, msg, panel, amount, cashoutTarget, round, confirmed, true)
 	case wallet.OutcomeRejected:
 		reason := ""
-		if err != nil { reason = err.Error() }
+		if err != nil {
+			reason = err.Error()
+		}
 		if _, fErr := gw.ledger.Fail(opCtx, debitEntry.TransactionID, reason); fErr != nil {
 			log.Printf("ledger: fail debit txn=%s: %v", debitEntry.TransactionID, fErr)
+		}
+		if gw.panelGuard != nil {
+			gw.panelGuard.Unlock(c.engineID(), panel)
 		}
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "débit refusé"}})
 	case wallet.OutcomeUnknown:
 		log.Printf("wallet: debit outcome indéterminé txn=%s betId=%s: %v", debitEntry.TransactionID, msg.BetID, err)
 		gw.markDebitForRefund(c, debitEntry, amount)
+		if gw.panelGuard != nil {
+			gw.panelGuard.Unlock(c.engineID(), panel)
+		}
 		c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "débit indéterminé, réessayez"}})
 	}
 }
@@ -445,11 +566,18 @@ func (gw *gateway) waitForLedgerResolution(ctx context.Context, txnID ledger.Tra
 	deadline := time.Now().Add(maxWait)
 	for {
 		entry, err := gw.ledger.GetByTransactionID(ctx, txnID)
-		if err != nil { return nil, err }
-		if entry.Status != ledger.StatusPending { return entry, nil }
-		if time.Now().After(deadline) { return nil, fmt.Errorf("ledger: résolution txn=%s: délai dépassé", txnID) }
+		if err != nil {
+			return nil, err
+		}
+		if entry.Status != ledger.StatusPending {
+			return entry, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("ledger: résolution txn=%s: délai dépassé", txnID)
+		}
 		select {
-		case <-ctx.Done(): return nil, ctx.Err()
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-time.After(pollInterval):
 		}
 	}
@@ -459,11 +587,18 @@ func (gw *gateway) placeBetOrReuse(c *client, msg clientMessage, panel v1.PanelI
 	gw.placeBetOrReuseEx(c, msg, panel, amount, cashoutTarget, round, debitEntry, false)
 }
 func (gw *gateway) placeBetOrReuseEx(c *client, msg clientMessage, panel v1.PanelID, amount int64, cashoutTarget float64, round *v1.RoundView, debitEntry *ledger.Entry, fresh bool) {
+	// FIX : persistance AVANT placement pour retrouver debitTxnID après restart
+	_ = gw.betStore.Remember(context.Background(), msg.BetID, debitEntry.TransactionID, c.operatorID, c.playerID)
+
 	bet, err := gw.eng.PlaceBet(c.engineID(), panel, amount, cashoutTarget)
 	if err != nil {
-		if errors.Is(err, errBetAlreadyExists()) {
+		// FIX BUG 2 : errBetAlreadyExists est var sentinel, pas func
+		if errors.Is(err, errBetAlreadyExists) {
 			if fresh {
 				gw.rollbackConfirmedDebit(c, msg, amount, round, debitEntry, errPanelOccupied)
+				if gw.panelGuard != nil {
+					gw.panelGuard.Unlock(c.engineID(), panel)
+				}
 				gw.announceExistingBet(c, panel, msg.Slot)
 				return
 			}
@@ -476,19 +611,24 @@ func (gw *gateway) placeBetOrReuseEx(c *client, msg clientMessage, panel v1.Pane
 				return
 			}
 			log.Printf("gateway: pari existant introuvable après ErrBetAlreadyExists player=%s panel=%d betId=%s: %v", c.playerID, panel, msg.BetID, err)
+			if gw.panelGuard != nil {
+				gw.panelGuard.Unlock(c.engineID(), panel)
+			}
 			c.sendJSON(map[string]any{"type": "BET_REJECTED", "data": map[string]any{"slot": msg.Slot, "reason": "pari déjà traité"}})
 			return
 		}
 		gw.rollbackConfirmedDebit(c, msg, amount, round, debitEntry, err)
+		if gw.panelGuard != nil {
+			gw.panelGuard.Unlock(c.engineID(), panel)
+		}
 		return
 	}
 	c.mu.Lock()
 	c.activeBets[panel] = bet
 	c.mu.Unlock()
+	// Garde le lock panel jusqu'au cashout/crash - ne pas unlock ici
 	c.sendJSON(map[string]any{"type": "BET_ACCEPTED", "data": map[string]any{"slot": msg.Slot}})
 }
-
-func errBetAlreadyExists() error { return fmt.Errorf("bet already exists") }
 
 func (gw *gateway) rollbackConfirmedDebit(c *client, msg clientMessage, amount int64, round *v1.RoundView, debitEntry *ledger.Entry, placeErr error) {
 	idemKey := fmt.Sprintf("rollback:%s:%s:%s", c.operatorID, c.playerID, debitEntry.TransactionID)
@@ -502,7 +642,9 @@ func (gw *gateway) rollbackConfirmedDebit(c *client, msg clientMessage, amount i
 		AmountMinor:         amount,
 		ParentTransactionID: debitEntry.TransactionID,
 	})
-	if rbErr != nil { log.Printf("ledger: begin rollback txn=%s: %v", debitEntry.TransactionID, rbErr) }
+	if rbErr != nil {
+		log.Printf("ledger: begin rollback txn=%s: %v", debitEntry.TransactionID, rbErr)
+	}
 	rb := wallet.Callback{
 		ID:             fmt.Sprintf("rollback-%s", debitEntry.TransactionID),
 		Type:           wallet.CallbackRollback,
@@ -514,7 +656,9 @@ func (gw *gateway) rollbackConfirmedDebit(c *client, msg clientMessage, amount i
 		Amount:         amount,
 		IdempotencyKey: idemKey,
 	}
-	if rollbackEntry != nil { rb.TransactionID = rollbackEntry.TransactionID }
+	if rollbackEntry != nil {
+		rb.TransactionID = rollbackEntry.TransactionID
+	}
 	if qErr := gw.walletQueue.Enqueue(context.Background(), rb); qErr != nil {
 		log.Printf("wallet: enqueue ROLLBACK txn=%s: %v", debitEntry.TransactionID, qErr)
 	}
@@ -524,7 +668,9 @@ func (gw *gateway) rollbackConfirmedDebit(c *client, msg clientMessage, amount i
 
 func (gw *gateway) handleCashout(c *client, msg clientMessage) {
 	panel, ok := product.SlotToPanel(msg.Slot)
-	if !ok { return }
+	if !ok {
+		return
+	}
 	c.mu.Lock()
 	bet, exists := c.activeBets[panel]
 	c.mu.Unlock()

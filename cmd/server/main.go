@@ -14,12 +14,12 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"github.com/tiidiio/223Gaming/internal/admin"
-	"github.com/tiidiio/223Gaming/internal/httpapi"
-	"github.com/tiidiio/223Gaming/internal/engine"
 	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
-        "github.com/tiidiio/223Gaming/internal/productadapter"
+	"github.com/tiidiio/223Gaming/internal/admin"
+	"github.com/tiidiio/223Gaming/internal/engine"
+	"github.com/tiidiio/223Gaming/internal/httpapi"
 	"github.com/tiidiio/223Gaming/internal/mongobridge"
+	"github.com/tiidiio/223Gaming/internal/productadapter"
 	"github.com/tiidiio/223Gaming/provider/ledger"
 	"github.com/tiidiio/223Gaming/provider/recovery"
 	"github.com/tiidiio/223Gaming/provider/wallet"
@@ -97,11 +97,16 @@ func main() {
 
 	engineConfig := engine.DefaultConfig()
 	engineConfig.NonceStore = admin.NewMongoNonceStore(store.DB)
+	// Chaîne de fairness persistée : seeds commités avant publication, reprise après redémarrage.
+	engineConfig.ChainStore = admin.NewMongoChainStore(store.DB)
 	innerEng, err := engine.NewCrashEngine(engineConfig)
-	if err != nil { log.Fatalf("engine: %v", err) }
+	if err != nil {
+		log.Fatalf("engine: %v", err)
+	}
 	adapter := productadapter.NewCrashAdapter(innerEng)
 
-	gw := newGateway(adapter, jwtSecret, walletClient, walletQueue, provLedger)
+	betStore := NewMemBetStore()
+	gw := newGateway(adapter, jwtSecret, walletClient, walletQueue, provLedger, betStore)
 
 	go func() {
 		if err := innerEng.Run(ctx); err != nil && ctx.Err() == nil {
@@ -114,7 +119,7 @@ func main() {
 	static := http.NewServeMux()
 	static.Handle("/api/admin/", admin.NewHandler(adminStore))
 	registerProviderConsole(static)
-		httpapi.AttachHandshake(static)
+	httpapi.AttachHandshake(static)
 	static.HandleFunc("/", serveStatic)
 
 	static.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -288,7 +293,15 @@ func forwardEvents(ctx context.Context, eng *engine.CrashEngine, pub *mongobridg
 					"multiplier": ev.Multiplier,
 					"elapsedMs":  elapsedMs,
 				})
-				gw.checkAutoCashout(ev.Multiplier)
+				// L'auto-cashout n'est plus évalué ici : le moteur paie les cibles à leur valeur
+				// exacte (événement AUTO_CASHOUT) avant l'émission du tick.
+
+			case engine.EventAutoCashout:
+				paid := make([]v1.BetView, 0, len(ev.CashedOutBets))
+				for _, b := range ev.CashedOutBets {
+					paid = append(paid, productadapter.ToBetView(b))
+				}
+				gw.settleAutoCashouts(paid)
 
 			case engine.EventCrash:
 				if err := pub.PublishCrash(ctx, ev.RoundID, ev.CrashPoint, ev.ServerSeed, ev.ClientSeed, ev.Nonce); err != nil {
@@ -299,7 +312,9 @@ func forwardEvents(ctx context.Context, eng *engine.CrashEngine, pub *mongobridg
 					"crashPoint": ev.CrashPoint,
 				})
 				lost := make([]v1.BetView, 0, len(ev.LostBets))
-				for _, b := range ev.LostBets { panel := v1.PanelA; if b.Panel == 1 { panel = v1.PanelB }; lost = append(lost, v1.BetView{ID: b.ID, UserID: b.UserID, Panel: panel, Amount: b.Amount}) }
+				for _, b := range ev.LostBets {
+					lost = append(lost, productadapter.ToBetView(b))
+				}
 				gw.notifyLostBets(lost)
 			}
 		}
