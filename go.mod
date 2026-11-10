@@ -9,7 +9,6 @@ require (
 	go.mongodb.org/mongo-driver v1.17.10
 	go.mongodb.org/mongo-driver/v2 v2.9.3
 	golang.org/x/crypto v0.58.0
-	golang.org/x/term v0.47.0
 )
 
 require (
