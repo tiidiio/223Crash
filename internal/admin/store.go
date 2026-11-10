@@ -405,3 +405,10 @@ func (s *MongoNonceStore) NextNonce(ctx context.Context) (int64, error) {
 
 	return result.Value, nil
 }
+
+func (s *Store) DB() *mongo.Database {
+	if s == nil || s.operators == nil {
+		return nil
+	}
+	return s.operators.Database()
+}

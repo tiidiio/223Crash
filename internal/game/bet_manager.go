@@ -204,7 +204,9 @@ func (bm *BetManager) PlaceBet(
 
 	bm.nextID++
 
-	betID := "bet-" + uint64ToString(bm.nextID)
+	// ID unique entre redémarrages (bootID) : la clé d'idempotence CREDIT
+	// "credit:<op>:<player>:<betID>" ne peut plus entrer en collision après un restart.
+	betID := uniqueID("bet", bm.nextID)
 
 	bet := &Bet{
 		ID:            betID,

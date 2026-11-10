@@ -3,7 +3,6 @@ package game
 import (
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -318,7 +317,9 @@ func cloneRound(round *Round) *Round {
 	return &copy
 }
 
-// formatRoundID génère un identifiant stable pour le round.
+// formatRoundID génère un identifiant de round unique entre redémarrages
+// ("round-<bootID>-<n>"), pour que externalRef et la réconciliation opérateur
+// ne collisionnent jamais.
 func formatRoundID(id uint64) string {
-	return "round-" + strconv.FormatUint(id, 10)
+	return uniqueID("round", id)
 }

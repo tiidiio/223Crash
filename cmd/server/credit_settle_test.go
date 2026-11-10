@@ -13,8 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Gaming/internal/product"
 	"github.com/tiidiio/223Gaming/provider/wallet"
+	"github.com/tiidiio/223Gaming/provider/ledger"
 )
 
 var csErrInfra = errors.New("infra: boom")
@@ -104,7 +105,7 @@ func csCreated(_ int, e ledger.NewEntry) (*ledger.Entry, bool, error) {
 func csSettler(t *testing.T, led *csLedger, q *csQueue) (*creditSettler, *csLogs) {
 	t.Helper()
 	logs := &csLogs{}
-	s := newCreditSettler(led, q, productGameID)
+	s := newCreditSettler(led, q, product.GameID)
 	s.logf = logs.logf
 	s.sleep = func(time.Duration) {}
 	s.spawn = func(f func()) { f() }
@@ -124,7 +125,7 @@ func TestCreditSettle_Nominal_BeginThenEnqueueWithTransactionID(t *testing.T) {
 	}
 
 	ne := led.entries[0]
-	if ne.Type != ledger.EntryCredit || ne.AmountMinor != 2500 || ne.GameID != productGameID {
+	if ne.Type != ledger.EntryCredit || ne.AmountMinor != 2500 || ne.GameID != product.GameID {
 		t.Errorf("NewEntry = %+v", ne)
 	}
 	if ne.IdempotencyKey != "credit:op1:pl1:bet-0001" {
@@ -141,7 +142,7 @@ func TestCreditSettle_Nominal_BeginThenEnqueueWithTransactionID(t *testing.T) {
 	if cb.ID != "credit-op1-pl1-bet-0001" || cb.IdempotencyKey != "credit:op1:pl1:bet-0001" {
 		t.Errorf("ID/clé callback = %q / %q", cb.ID, cb.IdempotencyKey)
 	}
-	if cb.Type != wallet.CallbackCredit || cb.Amount != 2500 || cb.RoundID != "r1" || cb.BetID != "bet-0001" || cb.GameID != productGameID {
+	if cb.Type != wallet.CallbackCredit || cb.Amount != 2500 || cb.RoundID != "r1" || cb.BetID != "bet-0001" || cb.GameID != product.GameID {
 		t.Errorf("callback = %+v", cb)
 	}
 }

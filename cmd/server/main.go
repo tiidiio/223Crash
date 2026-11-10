@@ -8,15 +8,18 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
 
-	"github.com/tiidiio/223Crash/internal/admin"
-	"github.com/tiidiio/223Crash/internal/betstore"
-	"github.com/tiidiio/223Crash/internal/engine"
-	"github.com/tiidiio/223Crash/internal/mongobridge"
+	"github.com/tiidiio/223Gaming/internal/admin"
+	"github.com/tiidiio/223Gaming/internal/httpapi"
+	"github.com/tiidiio/223Gaming/internal/engine"
+	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
+        "github.com/tiidiio/223Gaming/internal/productadapter"
+	"github.com/tiidiio/223Gaming/internal/mongobridge"
 	"github.com/tiidiio/223Gaming/provider/ledger"
 	"github.com/tiidiio/223Gaming/provider/recovery"
 	"github.com/tiidiio/223Gaming/provider/wallet"
@@ -94,34 +97,24 @@ func main() {
 
 	engineConfig := engine.DefaultConfig()
 	engineConfig.NonceStore = admin.NewMongoNonceStore(store.DB)
-	eng, err := engine.NewCrashEngine(engineConfig)
-	if err != nil {
-		log.Fatalf("engine: %v", err)
-	}
+	innerEng, err := engine.NewCrashEngine(engineConfig)
+	if err != nil { log.Fatalf("engine: %v", err) }
+	adapter := productadapter.NewCrashAdapter(innerEng)
 
-	gw := newGateway(eng, jwtSecret, walletClient, walletQueue, provLedger)
-
-	// Persistance durable des paris (collection crash_bets, créée à la demande). Activée AVANT le
-	// démarrage du moteur et des serveurs : aucun pari n'est accepté sans elle.
-	betStore, err := betstore.NewMongo(ctx, store.DB)
-	if err != nil {
-		log.Fatalf("bet store: %v", err)
-	}
-	if err := gw.enableBetPersistence(ctx, betStore, newInstanceID(), orphanGrace); err != nil {
-		log.Fatalf("bet persistence: %v", err)
-	}
+	gw := newGateway(adapter, jwtSecret, walletClient, walletQueue, provLedger)
 
 	go func() {
-		if err := eng.Run(ctx); err != nil && ctx.Err() == nil {
+		if err := innerEng.Run(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("engine: arrêt inattendu: %v", err)
 		}
 	}()
 
-	go forwardEvents(ctx, eng, publisher, gw)
+	go forwardEvents(ctx, innerEng, publisher, gw)
 
 	static := http.NewServeMux()
 	static.Handle("/api/admin/", admin.NewHandler(adminStore))
 	registerProviderConsole(static)
+		httpapi.AttachHandshake(static)
 	static.HandleFunc("/", serveStatic)
 
 	static.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -144,11 +137,12 @@ func main() {
 		}
 	})
 
-	go serve(ctx, httpPort, static, "static")
+	var serveWG sync.WaitGroup
+	staticServer := serve(&serveWG, httpPort, static, "static")
 
 	wsMux := http.NewServeMux()
 	wsMux.HandleFunc("/", gw.handleUpgrade)
-	go serve(ctx, wsPort, wsMux, "ws")
+	wsServer := serve(&serveWG, wsPort, wsMux, "ws")
 
 	verifyMux := http.NewServeMux()
 	verifyMux.HandleFunc("/verify/ping", func(w http.ResponseWriter, r *http.Request) {
@@ -156,11 +150,37 @@ func main() {
 		w.Write([]byte("pong"))
 	})
 	verifyMux.HandleFunc("/verify/", handleVerify(store))
-	go serve(ctx, verifyPort, verifyMux, "verify")
+	verifyServer := serve(&serveWG, verifyPort, verifyMux, "verify")
 
 	<-ctx.Done()
 	log.Println("arrêt en cours...")
-	time.Sleep(500 * time.Millisecond)
+
+	// Ordre : gateway d'abord (plus de nouvelle connexion WS, clients fermés, writePump signalés
+	// via done), puis les trois serveurs HTTP sous un délai GLOBAL unique de 10 s, puis attente
+	// des goroutines ListenAndServe. Aucune opération financière n'est déclenchée ici.
+	gw.Shutdown()
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+
+	for _, s := range []struct {
+		name string
+		srv  *http.Server
+	}{
+		{"static", staticServer},
+		{"ws", wsServer},
+		{"verify", verifyServer},
+	} {
+		if err := s.srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("%s: shutdown: %v", s.name, err)
+			if cerr := s.srv.Close(); cerr != nil {
+				log.Printf("%s: close: %v", s.name, cerr)
+			}
+		}
+	}
+
+	serveWG.Wait()
+	log.Println("arrêt terminé")
 }
 
 func requireEnv(key string) string {
@@ -178,7 +198,9 @@ func envOr(key, def string) string {
 	return def
 }
 
-func serve(ctx context.Context, port string, mux http.Handler, name string) {
+// serve démarre le serveur HTTP dans une goroutine suivie par wg et le renvoie : l'arrêt
+// (Shutdown/Close) est piloté par main(), dans l'ordre gateway → HTTP → attente des goroutines.
+func serve(wg *sync.WaitGroup, port string, mux http.Handler, name string) *http.Server {
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           mux,
@@ -189,17 +211,15 @@ func serve(ctx context.Context, port string, mux http.Handler, name string) {
 		MaxHeaderBytes:    16 << 10,
 	}
 
+	wg.Add(1)
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		srv.Shutdown(shutdownCtx)
+		defer wg.Done()
+		log.Printf("%s: écoute sur :%s", name, port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("%s: %v", name, err)
+		}
 	}()
-
-	log.Printf("%s: écoute sur :%s", name, port)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("%s: %v", name, err)
-	}
+	return srv
 }
 
 var allowedStaticFiles = map[string]string{
@@ -278,7 +298,9 @@ func forwardEvents(ctx context.Context, eng *engine.CrashEngine, pub *mongobridg
 					"roundId":    ev.RoundID,
 					"crashPoint": ev.CrashPoint,
 				})
-				gw.notifyLostBets(ev.LostBets)
+				lost := make([]v1.BetView, 0, len(ev.LostBets))
+				for _, b := range ev.LostBets { panel := v1.PanelA; if b.Panel == 1 { panel = v1.PanelB }; lost = append(lost, v1.BetView{ID: b.ID, UserID: b.UserID, Panel: panel, Amount: b.Amount}) }
+				gw.notifyLostBets(lost)
 			}
 		}
 	}
