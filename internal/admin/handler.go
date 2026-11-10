@@ -749,67 +749,9 @@ func validCSRFTokenFormat(token string) bool {
 	return err == nil && len(raw) == 32
 }
 
-func sameOrigin(r *http.Request) bool {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "development") {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return true
-		}
-		u, err := url.Parse(origin)
-		if err != nil {
-			return false
-		}
-		host := strings.ToLower(u.Host)
-		if strings.Contains(host, "127.0.0.1") || strings.Contains(host, "localhost") {
-			return true
-		}
-	}
-	allowed := os.Getenv("ALLOWED_ORIGINS")
-	if allowed != "" {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return true
-		}
-		u, err := url.Parse(origin)
-		if err != nil {
-			return false
-		}
-		for _, au := range strings.Split(allowed, ",") {
-			au = strings.TrimSpace(au)
-			if au == "" {
-				continue
-			}
-			auURL, err := url.Parse(au)
-			if err != nil {
-				continue
-			}
-			if sameOriginURL(u, auURL) {
-				return true
-			}
-		}
-		return false
-	}
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
-	}
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	expected := &url.URL{Scheme: u.Scheme, Host: r.Host}
-	return sameOriginURL(u, expected)
-}
 
-func sameOriginURL(a, b *url.URL) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	if !strings.EqualFold(a.Scheme, b.Scheme) {
-		return false
-	}
-	return strings.EqualFold(a.Host, b.Host)
-}
+
+
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -880,3 +822,94 @@ func validCSRFTokenFormatOld(token string) bool {
 }
 
 var _ = io.EOF
+
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	// Rejette "null", chemin, query, fragment, identifiants
+	u, err := security.ParseOrigin(origin)
+	if err != nil {
+		return false
+	}
+
+	// Origines autorisées configurées (ADMIN_PUBLIC_ORIGIN ou ALLOWED_ORIGINS)
+	allowedEnv := os.Getenv("ADMIN_PUBLIC_ORIGIN")
+	if allowedEnv == "" {
+		allowedEnv = os.Getenv("ALLOWED_ORIGINS")
+	}
+	if allowedEnv != "" {
+		for _, au := range strings.Split(allowedEnv, ",") {
+			au = strings.TrimSpace(au)
+			if au == "" {
+				continue
+			}
+			auURL, err := security.ParseOrigin(au)
+			if err != nil {
+				continue
+			}
+			if sameOriginURL(u, auURL) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Sans config : compare avec l'origine de la requête
+	reqHost := r.Host
+	if reqHost == "" {
+		reqHost = r.URL.Host
+	}
+	reqScheme := "http"
+	if r.TLS != nil {
+		reqScheme = "https"
+	} else if r.URL.Scheme == "https" {
+		reqScheme = "https"
+	} else if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		reqScheme = "https"
+	}
+	// Si l'URL de requête est HTTPS mais TLS nil (httptest), on garde https
+	if strings.HasPrefix(r.URL.String(), "https://") {
+		reqScheme = "https"
+	}
+
+	// En développement, localhost/127.0.0.1 sont tolérés même si scheme différent ? Non, tests exigent strict
+	// On ne bypass que si APP_ENV=development ET origin est localhost, pour ne pas casser les tests stricts
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "development") {
+		// Si origin vide déjà rejeté, si localhost on autorise
+		hostLower := strings.ToLower(u.Host)
+		if strings.Contains(hostLower, "127.0.0.1") || strings.Contains(hostLower, "localhost") {
+			return true
+		}
+	}
+
+	reqURL := &url.URL{Scheme: reqScheme, Host: reqHost}
+	return sameOriginURL(u, reqURL)
+}
+
+func sameOriginURL(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if !strings.EqualFold(a.Scheme, b.Scheme) {
+		return false
+	}
+	// Normalisation des ports par défaut
+	normalize := func(u *url.URL) (string, string) {
+		host := strings.ToLower(u.Hostname())
+		port := u.Port()
+		if port == "" {
+			if strings.EqualFold(u.Scheme, "https") {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+		return host, port
+	}
+	ah, ap := normalize(a)
+	bh, bp := normalize(b)
+	return ah == bh && ap == bp
+}
+

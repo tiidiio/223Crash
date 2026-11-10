@@ -217,3 +217,46 @@ func validateDNSName(host string) error {
 
 	return nil
 }
+
+// ParseOrigin valide une origine HTTP (scheme://host[:port]) pour CORS.
+func ParseOrigin(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, fmt.Errorf("origine vide")
+	}
+	if raw == "" || strings.Contains(raw, "#") || strings.Contains(raw, "?") {
+		// query/fragment interdits
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("origine invalide: %w", err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("origine sans scheme ou host")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("scheme origine invalide: %s", u.Scheme)
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("identifiants interdits dans origine")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return nil, fmt.Errorf("chemin interdit dans origine")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("query/fragment interdit")
+	}
+	if u.Opaque != "" {
+		return nil, fmt.Errorf("origine opaque")
+	}
+	if strings.HasSuffix(raw, ":") {
+		return nil, fmt.Errorf("port vide")
+	}
+	port := u.Port()
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("port origine invalide: %s", port)
+		}
+	}
+	return u, nil
+}
