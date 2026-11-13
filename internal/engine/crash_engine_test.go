@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/game"
+	"github.com/tiidiio/223Crash/internal/game"
 )
 
 func newTestEngine(t *testing.T) *CrashEngine {

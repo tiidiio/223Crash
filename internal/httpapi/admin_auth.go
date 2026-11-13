@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/adminauth"
+	"github.com/tiidiio/223Crash/internal/adminauth"
 )
 
 const adminCookieName = "223gaming_admin_session"

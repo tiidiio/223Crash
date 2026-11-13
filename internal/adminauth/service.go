@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/adminstore"
+	"github.com/tiidiio/223Crash/internal/adminstore"
 )
 
 const SessionDuration = 12 * time.Hour

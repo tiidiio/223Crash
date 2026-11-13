@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/adminstore"
-	"github.com/tiidiio/223Gaming/internal/gamecatalog"
-	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Crash/internal/adminstore"
+	"github.com/tiidiio/223Crash/internal/gamecatalog"
+	"github.com/tiidiio/223Crash/provider/ledger"
 )
 
 const (

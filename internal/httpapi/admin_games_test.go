@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/tiidiio/223Gaming/internal/gamecatalog"
+	"github.com/tiidiio/223Crash/internal/gamecatalog"
 )
 
 func TestAdminGamesHandler(t *testing.T) {

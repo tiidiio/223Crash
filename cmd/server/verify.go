@@ -9,8 +9,8 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/tiidiio/223Gaming/internal/engine"
-	"github.com/tiidiio/223Gaming/internal/mongobridge"
+	"github.com/tiidiio/223Crash/internal/engine"
+	"github.com/tiidiio/223Crash/internal/mongobridge"
 )
 
 // handleVerify implémente GET /verify/{roundId} : recalcule le crash point à partir du

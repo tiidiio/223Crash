@@ -4,7 +4,7 @@ import (
 	"net/http"
 
 	"github.com/gorilla/websocket"
-	"github.com/tiidiio/223Gaming/internal/ws"
+	"github.com/tiidiio/223Crash/internal/ws"
 )
 
 var upgrader = websocket.Upgrader{

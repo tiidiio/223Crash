@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiidiio/223Gaming/provider/wallet"
-	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Crash/provider/ledger"
+	"github.com/tiidiio/223Crash/provider/wallet"
 )
 
 var base = time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)

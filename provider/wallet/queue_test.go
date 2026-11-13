@@ -20,8 +20,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/tiidiio/223Gaming/provider"
-	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Crash/provider"
+	"github.com/tiidiio/223Crash/provider/ledger"
 )
 
 type testEnv struct {

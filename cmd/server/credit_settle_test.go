@@ -6,17 +6,18 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/tiidiio/223Gaming/internal/product"
-	"github.com/tiidiio/223Gaming/provider"
-	"github.com/tiidiio/223Gaming/provider/ledger"
-	"github.com/tiidiio/223Gaming/provider/wallet"
+	"github.com/tiidiio/223Crash/internal/product"
+	"github.com/tiidiio/223Crash/provider"
+	"github.com/tiidiio/223Crash/provider/ledger"
+	"github.com/tiidiio/223Crash/provider/wallet"
 )
 
 type csLedger struct {
-	fn        func(int, ledger.NewEntry) (*ledger.Entry, bool, error)
-	call      atomic.Int32
-	entries   []ledger.NewEntry
+	fn      func(int, ledger.NewEntry) (*ledger.Entry, bool, error)
+	call    atomic.Int32
+	entries []ledger.NewEntry
 }
+
 func (m *csLedger) Begin(_ context.Context, e ledger.NewEntry) (*ledger.Entry, bool, error) {
 	c := int(m.call.Add(1))
 	m.entries = append(m.entries, e)
@@ -27,6 +28,7 @@ func (m *csLedger) callCount() int { return int(m.call.Load()) }
 type csQueue struct {
 	cbs []wallet.Callback
 }
+
 func (m *csQueue) Enqueue(_ context.Context, cb wallet.Callback) error {
 	m.cbs = append(m.cbs, cb)
 	return nil
@@ -34,6 +36,7 @@ func (m *csQueue) Enqueue(_ context.Context, cb wallet.Callback) error {
 func (m *csQueue) count() int { return len(m.cbs) }
 
 type csLogs struct{ msgs []string }
+
 func (l *csLogs) logf(f string, a ...any) { l.msgs = append(l.msgs, fmt.Sprintf(f, a...)) }
 
 func csEntryFrom(e ledger.NewEntry, status ledger.EntryStatus) *ledger.Entry {

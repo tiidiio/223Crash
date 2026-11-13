@@ -36,7 +36,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/tiidiio/223Gaming/provider"
+	"github.com/tiidiio/223Crash/provider"
 )
 
 // Types d'identité canoniques du Provider Core — définis une seule fois dans

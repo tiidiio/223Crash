@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/adminauth"
-	"github.com/tiidiio/223Gaming/internal/adminstore"
-	"github.com/tiidiio/223Gaming/internal/productadapter"
-	"github.com/tiidiio/223Gaming/internal/ws"
+	"github.com/tiidiio/223Crash/internal/adminauth"
+	"github.com/tiidiio/223Crash/internal/adminstore"
+	"github.com/tiidiio/223Crash/internal/productadapter"
+	"github.com/tiidiio/223Crash/internal/ws"
 )
 
 type response struct {

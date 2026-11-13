@@ -14,7 +14,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/tiidiio/223Gaming/provider"
+	"github.com/tiidiio/223Crash/provider"
 )
 
 // Outcome classe le résultat d'un appel Send de façon à distinguer un rejet métier certain

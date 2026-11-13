@@ -10,7 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/tiidiio/223Gaming/internal/engine"
+	"github.com/tiidiio/223Crash/internal/engine"
 )
 
 // chainCollection : collection dédiée (évite tout conflit de schéma avec une éventuelle

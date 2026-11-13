@@ -3,12 +3,14 @@ package v1
 import "context"
 
 type PanelID int
+
 const (
 	PanelA PanelID = 0
 	PanelB PanelID = 1
 )
 
 type RoundState int
+
 const (
 	StateBettingOpen RoundState = iota
 	StateRunning
@@ -16,6 +18,7 @@ const (
 )
 
 type BetState int
+
 const (
 	BetPending BetState = iota
 	BetCashedOut
@@ -29,22 +32,23 @@ type RoundView struct {
 }
 
 type BetView struct {
-	ID            string  `json:"id"`
-	UserID        string  `json:"userId"`
-	Panel         PanelID `json:"panel"`
-	Amount        int64   `json:"amount"`
-	Payout        int64   `json:"payout"`
+	ID            string   `json:"id"`
+	UserID        string   `json:"userId"`
+	Panel         PanelID  `json:"panel"`
+	Amount        int64    `json:"amount"`
+	Payout        int64    `json:"payout"`
 	State         BetState `json:"state"`
-	RoundID       string  `json:"roundId"`
-	CashoutTarget float64 `json:"cashoutTarget"`
+	RoundID       string   `json:"roundId"`
+	CashoutTarget float64  `json:"cashoutTarget"`
 }
 
 type EngineEventType string
+
 const (
-	EventBettingOpen EngineEventType = "BETTING_OPEN"
+	EventBettingOpen  EngineEventType = "BETTING_OPEN"
 	EventRoundRunning EngineEventType = "ROUND_RUNNING"
-	EventTick EngineEventType = "TICK"
-	EventCrash EngineEventType = "CRASH"
+	EventTick         EngineEventType = "TICK"
+	EventCrash        EngineEventType = "CRASH"
 )
 
 type EngineEvent struct {

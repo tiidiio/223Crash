@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
+	v1 "github.com/tiidiio/223Crash/contracts/product/v1"
 )
 
 func TestProductSessionHandshakeIntegration(t *testing.T) {

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/tiidiio/223Gaming/provider"
-	"github.com/tiidiio/223Gaming/provider/ledger"
-	"github.com/tiidiio/223Gaming/provider/wallet"
+	"github.com/tiidiio/223Crash/provider"
+	"github.com/tiidiio/223Crash/provider/ledger"
+	"github.com/tiidiio/223Crash/provider/wallet"
 )
 
 type creditRequest struct {

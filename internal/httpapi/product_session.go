@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strings"
 
-	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
-	"github.com/tiidiio/223Gaming/internal/productadapter"
+	v1 "github.com/tiidiio/223Crash/contracts/product/v1"
+	"github.com/tiidiio/223Crash/internal/productadapter"
 )
 
 type productSessionHandler struct {

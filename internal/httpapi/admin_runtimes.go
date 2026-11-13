@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/gamecatalog"
-	"github.com/tiidiio/223Gaming/internal/runtimeregistry"
+	"github.com/tiidiio/223Crash/internal/gamecatalog"
+	"github.com/tiidiio/223Crash/internal/runtimeregistry"
 )
 
 // RuntimeRegistry est la vue du registre de runtimes dont la console a besoin.

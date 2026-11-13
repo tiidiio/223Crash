@@ -4,7 +4,7 @@ import (
 	"log"
 	"strings"
 
-	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
+	v1 "github.com/tiidiio/223Crash/contracts/product/v1"
 )
 
 // splitEngineID est l'inverse de client.engineID() ("operatorID:playerID"). wsIDPattern interdit

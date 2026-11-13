@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Crash/provider/ledger"
 )
 
 type qgStore struct {

@@ -1,4 +1,4 @@
-module github.com/tiidiio/223Gaming
+module github.com/tiidiio/223Crash
 
 go 1.26.0
 

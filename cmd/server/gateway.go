@@ -16,10 +16,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 
-	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
-	"github.com/tiidiio/223Gaming/internal/product"
-	"github.com/tiidiio/223Gaming/provider/ledger"
-	"github.com/tiidiio/223Gaming/provider/wallet"
+	v1 "github.com/tiidiio/223Crash/contracts/product/v1"
+	"github.com/tiidiio/223Crash/internal/product"
+	"github.com/tiidiio/223Crash/provider/ledger"
+	"github.com/tiidiio/223Crash/provider/wallet"
 )
 
 const noAutoCashoutSentinel = 50000.00
@@ -293,7 +293,7 @@ func (gw *gateway) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	claims, err := wsSecurity().validateToken(r.URL.Query().Get("token"), gw.jwtSecret)
 	if err != nil {
-		http.Error(w, "token invalide", http.StatusUnauthorized)
+		log.Printf("ws token invalide: %v url=%s", err, r.URL.String()); http.Error(w, "token invalide", http.StatusUnauthorized)
 		return
 	}
 	if !wsSecurity().acquire() {
@@ -687,3 +687,16 @@ func (gw *gateway) handleCashout(c *client, msg clientMessage) {
 }
 
 func centimesToUnits(c int64) float64 { return product.ToUnits(c) }
+
+func (gw *gateway) liveStats() (int,int) {
+  gw.mu.RLock()
+  defer gw.mu.RUnlock()
+  conns := len(gw.clients)
+  bets := 0
+  for _, c := range gw.clients {
+    c.mu.Lock()
+    bets += len(c.activeBets)
+    c.mu.Unlock()
+  }
+  return conns, bets
+}

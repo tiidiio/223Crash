@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/runtimeprobe"
+	"github.com/tiidiio/223Crash/internal/runtimeprobe"
 )
 
 type State string

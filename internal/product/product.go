@@ -1,48 +1,39 @@
 package product
 
 import (
-	"errors"
-	"fmt"
-
-	"github.com/tiidiio/223Gaming/internal/version"
+	"context"
+	v1 "github.com/tiidiio/223Crash/contracts/product/v1"
 )
 
-// ProductID représente un identifiant opaque de produit.
-type ProductID string
-
-const (
-	CrashGameID ProductID = "223crash"
-)
-
-// Definition encapsule les métadonnées d'un produit du catalogue B2B.
-type Definition struct {
-	ID          ProductID       `json:"id"`
-	Name        string          `json:"name"`
-	Version     version.Version `json:"version"`
-	Description string          `json:"description,omitempty"`
-	Enabled     bool            `json:"enabled"`
+func ForwardEvents(ctx context.Context, eng v1.GameEngine, pub Publisher, gw Broadcaster) {
+	for ev := range eng.Events() {
+		switch ev.Type {
+		case v1.EventBettingOpen:
+			_ = pub.PublishBettingOpen(ctx, ev.RoundID, ev.ServerSeedHash, ev.TimestampMs)
+			gw.Broadcast("ROUND_START", map[string]any{"roundId": ev.RoundID, "serverSeedHash": ev.ServerSeedHash, "startsAt": ev.TimestampMs})
+		case v1.EventRoundRunning:
+			_ = pub.PublishRoundRunning(ctx, ev.RoundID)
+			gw.Broadcast("ROUND_RUNNING", map[string]any{"roundId": ev.RoundID})
+		case v1.EventTick:
+			gw.Broadcast("TICK", map[string]any{"multiplier": ev.Multiplier})
+			gw.CheckAutoCashout(ev.Multiplier)
+		case v1.EventCrash:
+			_ = pub.PublishCrash(ctx, ev.RoundID, ev.CrashPoint, ev.ServerSeed, ev.ClientSeed, ev.Nonce)
+			gw.Broadcast("CRASH", map[string]any{"roundId": ev.RoundID, "crashPoint": ev.CrashPoint})
+			if len(ev.LostBets) > 0 {
+				gw.NotifyLostBets(ev.LostBets)
+			}
+		}
+	}
 }
 
-// NewCrashGameDefinition retourne la définition canonique de 223CRASH.
-func NewCrashGameDefinition(productVersionStr string) (Definition, error) {
-	v, err := version.Parse(productVersionStr)
-	if err != nil {
-		return Definition{}, fmt.Errorf("version de produit invalide pour 223CRASH: %w", err)
-	}
-
-	return Definition{
-		ID:          CrashGameID,
-		Name:        "223CRASH",
-		Version:     v,
-		Description: "B2B Provably Fair Crash Game Engine",
-		Enabled:     true,
-	}, nil
+type Publisher interface {
+	PublishBettingOpen(ctx context.Context, roundID, hash string, ts int64) error
+	PublishRoundRunning(ctx context.Context, roundID string) error
+	PublishCrash(ctx context.Context, roundID string, crashPoint float64, serverSeed, clientSeed string, nonce int64) error
 }
-
-// Validate s'assure que le produit respecte le périmètre strict.
-func (d Definition) Validate() error {
-	if d.ID != CrashGameID {
-		return errors.New("périmètre strict violé : seul 223CRASH est autorisé dans ce module")
-	}
-	return d.Version.Validate()
+type Broadcaster interface {
+	Broadcast(msgType string, data map[string]any)
+	CheckAutoCashout(multiplier float64)
+	NotifyLostBets(lost []v1.BetView)
 }

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/runtimeprobe"
+	"github.com/tiidiio/223Crash/internal/runtimeprobe"
 )
 
 // gateChecker bloque dans Check jusqu'à release : il simule un runtime lent.

@@ -3,7 +3,7 @@ package wallet
 import (
 	"time"
 
-	"github.com/tiidiio/223Gaming/provider"
+	"github.com/tiidiio/223Crash/provider"
 )
 
 // CallbackType identifie le sens du mouvement d'argent vis-à-vis de l'opérateur.

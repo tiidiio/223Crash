@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"github.com/tiidiio/223Crash/internal/security"
+
 	"crypto/tls"
 	"errors"
 	"net/http"
@@ -147,11 +149,11 @@ func TestParseOrigin(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := parseOrigin(tt.value)
+			_, err := security.ParseOrigin(tt.value)
 
 			if (err != nil) != tt.wantErr {
 				t.Fatalf(
-					"parseOrigin(%q), erreur = %v, wantErr = %v",
+					"security.ParseOrigin(%q), erreur = %v, wantErr = %v",
 					tt.value,
 					err,
 					tt.wantErr,
@@ -222,8 +224,8 @@ func TestParseOriginRejectsInvalidPorts(t *testing.T) {
 
 	for _, value := range tests {
 		t.Run(value, func(t *testing.T) {
-			if _, err := parseOrigin(value); err == nil {
-				t.Fatalf("parseOrigin(%q) aurait dû rejeter ce port", value)
+			if _, err := security.ParseOrigin(value); err == nil {
+				t.Fatalf("security.ParseOrigin(%q) aurait dû rejeter ce port", value)
 			}
 		})
 	}

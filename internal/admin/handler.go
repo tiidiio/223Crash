@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/security"
+	"github.com/tiidiio/223Crash/internal/security"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -749,10 +749,6 @@ func validCSRFTokenFormat(token string) bool {
 	return err == nil && len(raw) == 32
 }
 
-
-
-
-
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -912,4 +908,3 @@ func sameOriginURL(a, b *url.URL) bool {
 	bh, bp := normalize(b)
 	return ah == bh && ap == bp
 }
-

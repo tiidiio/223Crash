@@ -16,12 +16,12 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/tiidiio/223Gaming/internal/adminstore"
-	"github.com/tiidiio/223Gaming/internal/gamecatalog"
-	"github.com/tiidiio/223Gaming/internal/httpapi"
-	"github.com/tiidiio/223Gaming/internal/runtimeprobe"
-	"github.com/tiidiio/223Gaming/internal/runtimeregistry"
-	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Crash/internal/adminstore"
+	"github.com/tiidiio/223Crash/internal/gamecatalog"
+	"github.com/tiidiio/223Crash/internal/httpapi"
+	"github.com/tiidiio/223Crash/internal/runtimeprobe"
+	"github.com/tiidiio/223Crash/internal/runtimeregistry"
+	"github.com/tiidiio/223Crash/provider/ledger"
 )
 
 func main() {

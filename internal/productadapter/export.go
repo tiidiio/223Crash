@@ -1,8 +1,8 @@
 package productadapter
 
 import (
-	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
-	"github.com/tiidiio/223Gaming/internal/game"
+	v1 "github.com/tiidiio/223Crash/contracts/product/v1"
+	"github.com/tiidiio/223Crash/internal/game"
 )
 
 // ToBetView convertit une mise du moteur en BetView avec le MÊME mapping de panels que

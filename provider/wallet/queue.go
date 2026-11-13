@@ -9,7 +9,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/tiidiio/223Gaming/provider/ledger"
+	"github.com/tiidiio/223Crash/provider/ledger"
 )
 
 // Queue persiste les callbacks CREDIT/ROLLBACK dans Mongo et les rejoue en cas

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/adminauth"
-	"github.com/tiidiio/223Gaming/internal/adminstore"
+	"github.com/tiidiio/223Crash/internal/adminauth"
+	"github.com/tiidiio/223Crash/internal/adminstore"
 )
 
 type fakeOperatorRepository struct {

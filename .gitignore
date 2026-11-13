@@ -1,10 +1,40 @@
-bin/
+# === Secrets ===
 .env
+.env.*
+!.env.example
+*.jar
+.payload.json
+.login.json
+
+# === Binaries ===
+bin/
+*.exe
+*.bin
+gaming
+223gaming
+223crash
+
+# === Logs & Runtime ===
 logs/
 .runtime/
+*.log
+*.pid
 .domain
 /server
+.cache/
+.backup/
+
+# === Build ===
+frontend/dist
+dist/
 *.bak*
 *.v1
-*.log
-.env.*
+*.tmp
+
+# === Deps ===
+node_modules/
+vendor/
+
+# === OS ===
+.DS_Store
+Thumbs.db

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"sync"
 
-	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
-	"github.com/tiidiio/223Gaming/internal/product"
+	v1 "github.com/tiidiio/223Crash/contracts/product/v1"
+	"github.com/tiidiio/223Crash/internal/product"
 )
 
 var errPanelOccupied = errors.New("panel déjà occupé")

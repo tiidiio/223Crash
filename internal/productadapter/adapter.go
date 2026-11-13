@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
-	"github.com/tiidiio/223Gaming/internal/gamecatalog"
+	v1 "github.com/tiidiio/223Crash/contracts/product/v1"
+	"github.com/tiidiio/223Crash/internal/gamecatalog"
 )
 
 // DefaultProductAdapter implémente v1.ProductAdapter avec support des modes Demo et Integration.

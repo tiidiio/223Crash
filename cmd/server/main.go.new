@@ -1,0 +1,13 @@
+var allowedStaticFiles = map[string]string{
+        "/":              "play.html",
+        "/index.html":    "play.html",
+        "/play.html":     "play.html",
+        "/style.css":     "ui.css",
+        "/ui.css":        "ui.css",
+        "/ws.js":         "ws.js",
+        "/bets.js":       "bets.js",
+        "/ui-config.js":  "ui-config.js",
+        "/ui-canvas.js":  "ui-canvas.js",
+        "/ui-hud.js":     "ui-hud.js",
+        "/ui-main.js":    "ui-main.js",
+}

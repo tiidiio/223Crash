@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/gamecatalog"
+	"github.com/tiidiio/223Crash/internal/gamecatalog"
 )
 
 // adminGamesHandler : variante sans registre de runtimes (utilisée par les tests).

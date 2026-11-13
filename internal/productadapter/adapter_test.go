@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	v1 "github.com/tiidiio/223Gaming/contracts/product/v1"
+	v1 "github.com/tiidiio/223Crash/contracts/product/v1"
 )
 
 func TestClientCannotSpoofDemoToIntegration(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiidiio/223Gaming/internal/game"
+	"github.com/tiidiio/223Crash/internal/game"
 )
 
 const testGrowth = 0.00006

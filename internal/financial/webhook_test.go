@@ -24,7 +24,7 @@ func verifyWebhookTestSignature(secret string, timestampStr string, body []byte,
 
 func TestDispatchRoundEnded_SuccessAndSignature(t *testing.T) {
 	const secret = "test_webhook_secret_abc"
-	
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST method, got %s", r.Method)
