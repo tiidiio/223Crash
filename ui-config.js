@@ -1,10 +1,16 @@
-// ui-config.js — constantes et résolution de la connexion (jeton + adresse WebSocket).
-
+// ui-config.js — 223CRASH config réelle + WS sur :3000
 export const CONFIG = Object.freeze({
-  betWindowMs: 5000,            // doit correspondre à engine.DefaultConfig().BettingDuration
-  historySize: 24,
-  defaultWsPath: '/ws',         // chemin WebSocket du gateway (à ajuster si différent)
+  // Valeur de repli : le serveur n'envoie PAS la durée de la fenêtre de paris (seulement startsAt).
+  betWindowMs: 6000,
+  historySize: 32,
+  defaultWsPath: '',
+  defaultWsPort: 3000,
+  // Hostnames WS autorisés EN PLUS du hostname de la page. Le JWT n'est jamais envoyé ailleurs.
+  allowedWsHosts: Object.freeze([]),
+  defaultLang: 'fr',
+  langKey: '223crash.lang.v1',
   soundKey: '223crash.sound.v1',
+  volumeKey: '223crash.volume.v1',
   tokenKey: '223crash.session.v1',
 });
 
@@ -15,10 +21,13 @@ function storeToken(t) {
   try { sessionStorage.setItem(CONFIG.tokenKey, t); } catch (_) {}
 }
 
-// Jeton : ?token=... dans l'URL (fourni par l'opérateur), conservé pour la session de l'onglet
-// puis retiré de la barre d'adresse (évite fuite par historique ou en-tête Referer).
-// Adresse WS : ?ws=... acceptée uniquement sur le même hôte que la page — sinon un lien piégé
-// enverrait le jeton vers un serveur tiers.
+function isAllowedWsUrl(u) {
+  if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return false;
+  if (u.username || u.password) return false;
+  if (location.protocol === 'https:' && u.protocol !== 'wss:') return false;
+  return u.hostname === location.hostname || CONFIG.allowedWsHosts.includes(u.hostname);
+}
+
 export function resolveConnection() {
   const q = new URLSearchParams(location.search);
   let token = (q.get('token') || '').trim();
@@ -30,14 +39,13 @@ export function resolveConnection() {
   } else {
     token = readStoredToken();
   }
-
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  let url = `${proto}//${location.host}${CONFIG.defaultWsPath}`;
+  let url = `${proto}//${location.hostname}:${CONFIG.defaultWsPort}`;
   const custom = (q.get('ws') || '').trim();
   if (custom) {
     try {
       const u = new URL(custom, location.href);
-      if ((u.protocol === 'ws:' || u.protocol === 'wss:') && u.host === location.host) url = u.href;
+      if (isAllowedWsUrl(u)) url = `${u.protocol}//${u.host}${u.pathname === '/' ? '' : u.pathname}`;
     } catch (_) {}
   }
   return { url, token };
