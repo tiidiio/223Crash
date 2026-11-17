@@ -1,9 +1,0 @@
-bin/
-.env
-logs/
-.runtime/
-.domain
-/server
-*.bak*
-*.v1
-*.log
